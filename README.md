@@ -14,6 +14,8 @@ This document provides an overview of the entire project, while details of each 
 The GIFs below demonstrate the operation of each module in the project.  
 Clicking on the links under each GIF will take you to documents that describe the corresponding module in more detail.
 
+
+
 - **Control**: Receives information from the perception and decision-making systems to ultimately control the vehicle to either stop or follow a path. Research was conducted on various control algorithms, including Pure Pursuit and Stanley.
 
 - **Perception**: Processes input data from camera sensors to recognize lane markings, traffic signs, and other elements necessary for autonomous driving.
