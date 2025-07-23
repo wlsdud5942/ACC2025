@@ -1,6 +1,6 @@
 # ACC2025
 
-<img src="image/kdasmain.gif" alt="KDAS" width="800"/>
+<img src="images/kdasmain.gif" alt="KDAS" width="800"/>
 
 ---
 
