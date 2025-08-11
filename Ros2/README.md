@@ -74,36 +74,6 @@ The design emphasizes **timing robustness**, **deterministic handshakes**, and *
 
 - **SLAM**
   - **Cartographer 2D** (LiDAR + IMU), `use_sim_time`, custom TF broadcaster for `base_link ↔ laser`.
-
-> Optional, include this in the repo as `mermaid`:
-
-```mermaid
-flowchart LR
-  subgraph Perception
-    A[SCNN] -->|/centerline_3d| P1
-    B[YOLOv7] -->|/obstacle_info, /yolo_stop| OA
-  end
-  subgraph Planning
-    RRT[RRT → waypoints_*.json]
-    DQN[DQN → dqn_paths.json]
-    P1[HelperPathSender / PathSenderNode]
-    RRT --> P1
-    DQN --> P1
-  end
-  subgraph Avoidance
-    OA[Obstacle Avoidance] -->|/avoid_start, /avoid_done| P1
-    P1 -->|/path_x, /path_y| CTRL
-    OA -->|/path_x, /path_y| CTRL
-  end
-  subgraph Control
-    CTRL[Simulink FSM (C++)] -->|/cmd| Vehicle
-    P1 -->|/path_mode, /stop, /pickup_dropoff| CTRL
-  end
-  subgraph SLAM
-    SL[Cartographer] -->|/tf, /pose| P1
-  end
-```
-
 ---
 
 ## 4) Interface Contracts (Summary)
@@ -146,36 +116,7 @@ Remove distance-based reach logic from Simulink. Make transitions **event-driven
 
 ---
 
-## 7) Launch & Operations
-
-**Bringup (skeleton)**
-```bash
-# Perception
-ros2 launch perception realsense_scnn_yolov7.launch.py
-
-# SLAM
-ros2 launch cartographer_ros cartographer.launch.py use_sim_time:=true
-
-# Planning
-ros2 run planning helper_path_sender     # or: ros2 run planning path_sender_node
-
-# Obstacle Avoidance
-ros2 run obstacle_avoidance waypoint_generator
-
-# Control (Simulink codegen)
-ros2 run control fsm_node
-```
-
-**Operational checklist**
-- [ ] `dqn_paths.json` present; `HelperPathSender` streams **without** reach gating.  
-- [ ] `/path_mode`, `/stop`, `/pickup_dropoff` are **events**, not distance-derived in control.  
-- [ ] Avoidance merges **current+next** path and **gates** base stream while active.  
-- [ ] `/tf` tree stable; `/tf_static` persists across restarts.  
-- [ ] SCNN centerline vs SLAM pose **drift monitor** active (thresholds & alerts logged).
-
----
-
-## 8) Logging & Monitoring
+## 7) Logging & Monitoring
 
 - **Drift**: lateral error between **centerline** and **SLAM pose** → `logs/slam_drift.csv`.  
 - **Streaming**: segment indices, timestamps, count of published points.  
@@ -184,7 +125,7 @@ ros2 run control fsm_node
 
 ---
 
-## 9) Directory Layout (suggested)
+## 8) Directory Layout (suggested)
 
 ```
 ros2/
@@ -206,7 +147,7 @@ ros2/
 
 ---
 
-## 10) Known Issues & Mitigations
+## 9) Known Issues & Mitigations
 
 | Issue                           | Mitigation |
 |---------------------------------|------------|
