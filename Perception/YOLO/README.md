@@ -1,69 +1,107 @@
-# YOLOv7 – Traffic Object Detection
+# YOLOv7-based Object Detection
+This module performs **real-time road-object detection**—stop lines, crosswalks, traffic signage—using **YOLOv7** and fuses results with **Depth** to recover **3D positions**. We adopted **v7** instead of v8 due to Jetson compatibility issues (custom C++ ops). Outputs feed directly into the FSM for stop/avoid decisions and into Planning for obstacle-aware behavior.
 
-## Introduction
+---
 
-This module performs real-time object detection using forward-facing camera input to recognize various traffic signs such as stop signs, crosswalks, yield signs, and roundabouts.  
-The detection results are published via ROS2 and consumed by a Simulink-based control system, where Stateflow logic uses the object class information to trigger vehicle behavior transitions (e.g., stop, slow down).
+## 1) Objectives
+- Emit **FSM events** (e.g., `/yolo_stop`) when specific objects are detected with high confidence.
+- Provide **3D positions** (meters) for detections so that avoidance and stopping logic can operate in physical space.
 
-## Why YOLOv7?
+---
 
-Initially, the team planned to use YOLOv8 with the Ultralytics library.  
-However, during integration on the **QCar2 platform (Jetson AGX Orin)**, we encountered **compatibility issues with the Ultralytics framework**, particularly related to ROS2 integration, Python environment conflicts, and inference crashes.
+## 2) Model Choice & Runtime Environment
+- **Why YOLOv7 (not v8)**: v8 required ops that conflicted with our Jetson stack; v7 ran reliably after dependency cleanup.
+- **Repo customization**: trimmed visualization and heavy dataloaders; added a **ROS2 node** interface.
+- **Typical Jetson setup (example)**: Python 3.8, CUDA 11.4, cuDNN compatible, PyTorch 1.12.x.
+- **Inference knobs**: image size 640, FP16 (half precision) where stable, NMS tuned per class.
 
-As a result, we migrated to **YOLOv7** for the following reasons:
+---
 
-- PyTorch-based, with better compatibility with ROS2  
-- Lightweight "tiny" version available for real-time inference on Jetson platforms  
-- Actively maintained with many open-source implementations  
-- Balanced performance in terms of speed and accuracy (mAP)
+## 3) Custom Training & Classes
+- **Data**: in-house captures + selected open datasets to reduce domain gap (lighting, paint wear, camera height).
+- **Classes** (example): `stop`, `crosswalk`, `red_light`.
+- **Training example**: epochs = 100, img size = 640, batch = 16, model = `yolov7-tiny`.
+- **Tuning philosophy**: favor **precision** over recall for critical classes (minimize false stop-line triggers).
+- **Recommended augmentations**: brightness/contrast jitter, motion blur (mild), random crop/scale, hue shift (small).
+- **Artifacts to store**: `weights/best.pt`, class map, normalization settings, and a metrics summary (mAP / precision by class).
 
-## Dataset
+---
 
-- Images were collected using the Intel RealSense camera while driving on the actual indoor track  
-- Label format follows YOLO convention:  
-  `<class_index> <x_center> <y_center> <width> <height>` (all values normalized)  
-- Class list:
-  - 0: Stop Sign  
-  - 1: Red Light 
+## 4) ROS2 Integration
 
-- Dataset split: 80% train, 20% valid
-- Testing was performed in real-world driving scenarios
+**Subscriptions**
+- `/camera/color/image_raw` (`sensor_msgs/Image`, BGR8). Use the camera frame’s `stamp`/`frame_id`.
 
-## Training Configuration
+**Publications**
+- `/obstacle_info` (`std_msgs/Float32MultiArray`): per detection → `[x, y, z, cls_id, conf]` in meters (define and keep a consistent frame, e.g., `base_link`).
+- `/yolo_stop` (`std_msgs/Int32`): `0/1` event for the FSM when a stop line is confidently detected.
 
-- Model: YOLOv7-tiny  
-- Epochs: 100  
-- Optimizer: SGD  
-- Loss functions: CIoU, BCE  
-- Input image size: 640x480  
-- Data augmentation: brightness variation, motion blur, horizontal flip  
-- Validation accuracy: ~92% mAP@0.5
+**QoS**
+- Images: `SensorDataQoS` or `best_effort`.
+- Events/3D outputs: `reliable`, `keep_last(10)`.
 
-## ROS2 Integration
+**Per-class thresholds (example)**
+- stop: `conf ≥ 0.6`, `NMS IoU ≤ 0.45`
+- crosswalk: `conf ≥ 0.5`
+- red_light: `conf ≥ 0.5`
 
-- **Input Topic**: `/camera/color/image_raw`  
-- **Output Topic**: `/traffic_sign_topic` (`std_msgs/Int32`)  
-- **Published Message**: Class index of detected object (e.g., STOP → 0)  
-- **Inference Speed**: ~15 FPS on Jetson AGX Orin  
-- Simulink subscribes to this topic to trigger state transitions in Stateflow
+---
 
-## Example Output
+## 5) 3D Localization with Depth
 
-| Input Image | Detection Result |
-|-------------|------------------|
-| ![](../image/yolo_input.png) | ![](../image/yolo_output.png) |
+**Depth source**
+- `/camera/depth/image_raw` (`16UC1` or `32FC1`, meters). Align with the color stream.
 
-## Simulink Integration Example
+**Robust depth estimate**
+- Take a **k×k windowed median** around the BBox center (k = 3–7) to reduce NaNs/spikes.
+- Clamp valid range (e.g., 0.3–6.0 m). If median invalid, expand window or fall back to nearest valid pixel within radius r.
 
-- `/traffic_sign_topic` → Connected to Simulink `Subscribe` block  
-- Used in Stateflow to define transitions such as:  
-  - Detecting a Stop Sign → transition from "Driving" to "Stop"
+**Projection**
+- From pixel `(u, v)` and depth `Z`, compute camera-frame point:
+  - `X = (u − cx) / fx × Z`, `Y = (v − cy) / fy × Z`.
+- Transform `(X, Y, Z)` to **`base_link`** using the calibrated extrinsics (`T_base_link^camera`) before publishing.
 
-## File Structure
+**Contract**
+- `/obstacle_info` can concatenate multiple detections:
+  - `[x1,y1,z1,cls1,conf1, x2,y2,z2,cls2,conf2, …]`
+  - Always document which frame you use (`camera` or `base_link`) and keep it consistent.
 
-- `yolo_node.py`: ROS2 node for YOLOv7 inference  
-- `weights/yolov7.pt`: Pretrained YOLOv7 model weights  
-- `launch/yolo_launch.py`: ROS2 launch file  
-- `config.yaml`: Class names and path configuration  
-- `label/`: Folder containing YOLO-format annotation files  
+---
 
+## 6) Processing Flow (Runtime)
+
+1. Receive an RGB frame.
+2. Run YOLOv7 inference → BBoxes, classes, confidences.
+3. For each detection, pull a windowed median depth around the BBox center.
+4. Project to 3D and transform to `base_link`.
+5. Publish `/obstacle_info`. If a **stop** is confidently detected and within the relevant ROI/range, publish `/yolo_stop = 1`.
+6. Control FSM transitions based on these events.
+
+---
+
+## 7) Troubleshooting & Tuning
+
+Issue | Mitigation
+--- | ---
+YOLOv8 not runnable on Jetson | Use **YOLOv7**; pin CUDA/cuDNN/PyTorch versions that match Jetson image.
+Depth at center is NaN | Windowed median, expand window adaptively; fallback to nearest valid depth within radius.
+Stop vs lane confusion | Add diverse training samples; post-process with lane mask geometry checks (e.g., alignment angle).
+Over-detections (signage) | Raise class-specific `conf` and tighten NMS; restrict to **ROI** where objects are plausible.
+Jittery 3D | Temporal median of depth; reject outliers by speed/acceleration bounds in `base_link`.
+
+---
+
+## 8) Message & File Layout
+- Topics
+  - `/obstacle_info`: Float32MultiArray, concatenated detections in meters (document frame).
+  - `/yolo_stop`: Int32, 0/1 event.
+
+- Directory
+  - `yolov7/`
+    - `README.md`
+    - `weights/best.pt`
+    - `config/thresholds.yaml` (per-class `conf`/NMS/ROI)
+    - `nodes/yolov7_node.py` (ROS2 node)
+    - `utils/` (preprocess, depth utils)
+
+---
