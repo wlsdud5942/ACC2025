@@ -1,4 +1,4 @@
-# `dqn/` — Visit-Order Optimization with a Lightweight DQN
+# `DQN` — Visit-Order Optimization with a Lightweight DQN
 
 This module computes a **visit sequence** for user-specified **stops / waypoints** on a **directed graph** (nodes `0..59`). It uses a tiny **Deep Q-Network (NumPy-only)** with a robust **BFS fallback** to avoid dead-ends and loops. The final plan is written to **`dqn_paths.json`**, which `helper_path_sender` consumes directly for runtime streaming.
 
