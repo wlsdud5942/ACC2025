@@ -1,83 +1,141 @@
-# Perception
+# Perception Module
 
-## Introduction
-
-This module processes RGB and depth camera data from the vehicle to recognize key driving environment features such as traffic signs and lane markings.  
-It provides the control and localization systems with accurate, real-time information extracted through deep learning models.  
-Two separate perception pipelines are implemented:
-
-- **YOLOv7** for traffic object detection
-- **SCNN** for lane centerline detection and localization refinement
-
-All outputs are published over ROS2 and used either in Simulink-based control systems or Cartographer SLAM correction modules.
+This directory documents the **full perception stack** for our autonomous vehicle. The stack consists of **SCNN-based lane detection** and **YOLOv7-based object detection**, both driven by **Intel RealSense D435i RGB + Depth**. Outputs are expressed in **metric 3D coordinates** (centerline, stop line / signage, obstacles) and fed to **Planning / Control / ROS2** for path generation, FSM transitions, and avoidance decisions.
 
 ---
 
-## System Overview
-
-The perception system is divided into two core components:
-
-- **YOLOv7 (Object Detection)**  
-  Detects traffic signs (e.g., Stop, Crosswalk, Roundabout) in real time.  
-  Detection results are published as ROS2 messages and used by Simulink’s Stateflow controller to trigger behavioral transitions (e.g., stopping, slowing).
-
-- **SCNN (Lane Detection for Localization Refinement)**  
-  Detects lane centerlines from RGB images and converts them into real-world coordinates using depth data.  
-  These points are matched against the pre-built Cartographer SLAM map to refine the vehicle’s estimated pose.
+## 1) Goals & Scope
+- Detect a **3D lane centerline** and **road objects** in real time and convert them to **actionable metric units (meters)**.
+- Provide lane, stop line, crosswalk, and sign detections under **consistent QoS & timestamping**.
+- Compare the **SCNN-derived 3D centerline** against **Cartographer SLAM** poses to monitor and mitigate **long-term drift**.
 
 ---
 
-## Data Flow Architecture (Visualized)
+## 2) Frames & Calibration
 
-The RealSense D435i camera streams both RGB and Depth frames to the perception nodes.  
-- The YOLO node publishes detection results to `/traffic_sign_topic`, consumed by the Simulink controller.  
-- The SCNN pipeline extracts lane masks and computes 3D (x, y, z) coordinates of the road centerline using depth data.  
-- These coordinates are then aligned with Cartographer’s SLAM map to refine vehicle localization.
+Frames
+- Camera (RealSense optical): x → right, y → down, z → forward (RealSense SDK convention).
+- Vehicle (base_link): x → forward, y → left, z → up.
+- Extrinsics: fixed transform T_base_link^camera broadcast via ROS TF.
 
-> See the Mermaid graph at the bottom of this file for the full system flow.
+Calibration workflow
+1. Estimate intrinsics/extrinsics with a checkerboard (OpenCV).
+2. Register the static transform via static_transform_publisher.
+3. Verify alignment in RViz (image overlay / depth alignment).
 
----
+Intrinsics (example placeholders)
+- fx, fy, cx, cy (replace with measured values).
 
-## Role of Each Model
-
-### YOLOv7
-
-- Real-time inference using PyTorch-based YOLOv7  
-- Publishes object class index via `/traffic_sign_topic`  
-- Enables vehicle state transitions in Simulink Stateflow  
-- Detected objects: Stop Sign, Crosswalk, Roundabout, Yield, etc.
-
-### SCNN + Depth
-
-- Extracts lane masks from RGB images  
-- Uses pixel coordinates and depth values to compute (x, y, z) lane centerline points  
-- Publishes coordinates to `/lane_points_3D`  
-- These are then compared with Cartographer’s static map to refine SLAM-based localization  
-- Improves positioning accuracy beyond LiDAR-only SLAM
+Suggested storage
+- perception/calib/realsense_intrinsics.yaml
 
 ---
 
-## Directory Structure
+## 3) Sensors & Key Topics
 
-- `YOLO/` – YOLOv7 ROS2 node, weight files, and launch scripts  
-- `SCNN/` – SCNN inference code, postprocessing, depth projection, and ROS2 node  
-- `launch/` – Combined ROS2 launch files for both models  
-- `image/` – Test outputs, visualizations, and debugging images
+Device / Topic | Type | Contract
+--- | --- | ---
+RealSense D435i (640×480 RGB + Depth) | – | Color/Depth approx sync (or composed callback)
+/camera/color/image_raw | sensor_msgs/Image | BGR8, stamp/frame_id = camera frame
+/camera/depth/image_raw | sensor_msgs/Image | 16UC1 or 32FC1, meters
+/lane_mask | sensor_msgs/Image | SCNN binary mask (0 / 255), 640×480
+/centerline_3d | std_msgs/Float32MultiArray | Flat array: [x1,y1,z1, x2,y2,z2, …] (meters, base_link recommended)
+/obstacle_info | std_msgs/Float32MultiArray | e.g., [x, y, z, cls_id, conf] (meters, camera or base_link; be explicit)
+/yolo_stop | std_msgs/Int32 | 0/1 stop-line event
+
+QoS recommendations
+- Images: best_effort or SensorDataQoS.
+- Control-relevant streams: reliable, keep_last(10).
+- Maintain consistent frame_id & timestamps.
 
 ---
 
-## Results and Performance
+## 4) SCNN-based Lane Detection (Summary)
 
-- YOLOv7 successfully detects traffic signs in real-time (~15 FPS) on embedded hardware  
-- SCNN lane detection operates stably across curves, occlusions, and shadows  
-- Cartographer-based localization accuracy improved when matched with SCNN+Depth-derived coordinates  
-- Integrated system showed stable control transitions (via Simulink) and improved lane-level localization
+Input / Output
+- Input: 640×480 RGB.
+- Output: binary lane mask and a 3D centerline.
+
+Post-processing
+1. Row-wise DBSCAN to cluster lane pixels.
+2. 3rd-order polyfit per cluster.
+3. Average left/right fits → centerline in image coords.
+
+Depth fusion (camera frame)
+- Given pixel (u, v) and depth Z:
+  - X = (u - cx) / fx * Z
+  - Y = (v - cy) / fy * Z
+- Project (X, Y, Z) to base_link via TF before publishing.
+
+Drift monitoring
+- Compare centerline-derived lateral position vs SLAM pose; track the lateral error as a drift indicator.
+
+See also: perception/scnn/README.md
 
 ---
 
-## Future Work
+## 5) YOLOv7-based Object Detection (Summary)
 
-- Evaluate LaneFormer or BEV-based lane detectors for better generalization  
-- Fuse additional perception outputs (e.g., curb or sidewalk) into localization  
-- Apply bundle adjustment or EKF to further integrate perception-localization fusion
+Why v7
+- Jetson compatibility issues with YOLOv8 (C++ ops) → YOLOv7 with tuned dependencies.
+
+Classes (project-dependent examples)
+- stop_line, crosswalk, sign (extend as needed).
+
+Depth extraction
+- Use a windowed median around the BBox center to reduce missing/noisy depth.
+
+Outputs
+- /obstacle_info: [x, y, z, cls_id, conf] (define frame explicitly).
+- /yolo_stop: 0/1 for the FSM when a stop line is confidently detected.
+
+See also: perception/yolov7/README.md
+
+---
+
+## 6) RealSense Integration & Depth Use
+
+- From SCNN/YOLO pixel coordinates, fetch depth from /camera/depth/image_raw.
+- Convert to 3D (camera frame) → transform to base_link with TF → publish.
+- Depth noise mitigation: 3×3–7×7 median or biweight window; interpolate NaNs.
+- Time sync: ApproximateTimeSynchronizer or composition node with stamp reordering.
+
+---
+
+## 7) Processing Pipeline (Parallelized)
+
+- Parallel branches to minimize latency:
+  - SCNN path: RGB → mask → centerline → depth → 3D centerline
+  - YOLOv7 path: RGB → detections → depth window median → 3D objects
+- Both publish to ROS2 → Planning / Control (FSM) consume.
+
+---
+
+## 8) Known Issues & Mitigations
+
+Issue | Mitigation
+--- | ---
+RGB–Depth sync mismatch | Approx sync + consistent frame_id; prefer camera HW timestamp
+YOLOv8 incompat on Jetson | Switch to YOLOv7; clean deps; optimize NMS / FP16
+Missing / spiky depth | Windowed median around BBox center; clamp valid range (e.g., 0.3–6 m)
+Centerline jumps | Sliding polyfit window, outlier rejection (RANSAC option)
+
+---
+
+## 9) Message Contracts (Examples)
+
+- /centerline_3d (Float32MultiArray)
+  - data: [x1, y1, z1, x2, y2, z2, ..., xN, yN, zN]   (meters, base_link)
+  - layout.dim[0]: size = 3N, stride = 1, label = "xyz_flat"
+
+- /obstacle_info (Float32MultiArray)
+  - Single detection: [x, y, z, cls_id, conf]
+  - Multiple detections (recommended): concatenate per detection  
+    [x1, y1, z1, cls1, conf1, x2, y2, z2, cls2, conf2, ...]
+  - Define and keep a consistent coordinate frame (camera or base_link).
+
+- /yolo_stop (Int32)
+  - data: 0 | 1 (1 when a stop line is confidently detected)
+
+---
 
