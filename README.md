@@ -128,7 +128,7 @@ When Cartographer ran in Docker and LiDAR/TF on host, timestamps diverged.
 2. **`planning/README.md` → `planning/rrt/`, `planning/dqn/`** — Why we moved to offline path generation + order optimization; review the **streaming** design in `helper_path_sender`.
 3. **`Obstacle_Avoidance/README.md`** — Offset-curve, minimal-clearance avoidance (details & visuals).
 4. **`ros2_system/README.md`** — `data_helper`, Cartographer, Simulink codegen, QoS/TF/time-sync.
-5. **`control/README.md`** — Why **Pure Pursuit + FSM (no PID)**, parameter scheduling, and real-vehicle fixes.
+5. **`control/README.md`** — Why **Pure Pursuit + FSM**, parameter scheduling, and real-vehicle fixes.
 
 ---
 
