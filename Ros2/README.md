@@ -93,7 +93,7 @@ The design emphasizes **timing robustness**, **deterministic handshakes**, and *
 
 ---
 
-## 5) Simulink → ROS 2 Codegen (Strategy)
+## 5) Simulink → ROS 2 Codegen
 
 **Why codegen?** Speed of tuning + reproducibility with a deterministic controller.
 
@@ -125,7 +125,7 @@ Remove distance-based reach logic from Simulink. Make transitions **event-driven
 
 ---
 
-## 8) Directory Layout (suggested)
+## 8) Directory Layout
 
 ```
 ros2/
