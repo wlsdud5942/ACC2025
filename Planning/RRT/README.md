@@ -1,266 +1,207 @@
-# RRT — Offline RRT Path Set Generation 
+# RRT — Offline Path Set Generation (Revised, Process-Centric)
 
-This module builds a **high-quality set of offline paths** for a **static track**. Instead of computing paths online, we repeatedly run **RRT** (dozens to thousands of trials per node pair X→Y), evaluate each candidate by **length / curvature / continuity**, smooth and resample it, and persist only the **best** as `waypoints_XtoY.json`. These curated segments are later stitched (via `dqn_paths.json`) and streamed at runtime by the planning stack.
+This module builds a **high-quality set of offline paths** for a **static track**. Instead of computing paths online, we repeatedly run **RRT** (dozens to thousands of trials per node pair X→Y), evaluate each candidate by **length / curvature / continuity / clearance**, smooth and resample it, and persist only the **best** as `waypoints_XtoY.json`. These curated segments are later stitched (via `dqn_paths.json`) and streamed at runtime by the planning stack.
+
 
 ---
 
 ## 0) Purpose
 
 On a static course, **precomputing** robust segments is safer than relying on on-the-fly search. The objective is to:
-- Generate multiple candidate paths for each directed pair **X→Y** between meaningful track nodes (splits, corners, stops, pickup/dropoff).
+- Generate multiple candidate paths for each directed pair **X→Y** (splits, corners, stops, pickup/dropoff).
 - Score and filter candidates using geometric and dynamic criteria.
 - **Normalize** spacing and heading, and smooth curvature.
-- Save a **single champion** (or a small Pareto set) per pair to `waypoints_XtoY.json`.
+- Save a **single champion** (or a small Pareto set) per pair to `waypoints_XtoY.json` (+ metadata).
+
+**Frames & Units**
+- All waypoints and node anchors are in the **`map`** (track-plane) frame, **meters**.
+- If a different frame is required, provide a TF transform at **consume** time; do **not** mix frames in offline artifacts.
 
 ---
 
 ## 1) Process Timeline (Experiment Log Style)
 
-V0 — Single-shot RRT (baseline; did not meet quality)
-- Attempt: one run per pair.
-- Observations: high variance; occasional discontinuities and excessive curvature; micro-vibrations on the vehicle due to heading jitter.
-- Lesson: RRT is stochastic; single samples are unreliable for production.
+**V0 — Single-shot RRT (baseline; did not meet quality)**
+- One run per pair → high variance; occasional discontinuities and excessive curvature; micro-vibrations due to heading jitter.
 
-V1 — Multi-run + filtering (large improvement)
-- Method: run RRT **N times** per X→Y (N = 50–2000 depending on pair difficulty).
-- Metrics: total length L, average curvature κ̄, curvature peak κ_max, continuity penalties (heading jumps).
-- Selection: keep the top **k%** (e.g., 10–20%) by a composite score; discard the rest.
+**V1 — Multi-run + filtering (large improvement)**
+- Run RRT **N times** per X→Y (N=50–2000). Keep top **k%** by composite score; discard the rest.
 
-V2 — Smoothing + heading normalization (stability)
-- Resampling: uniform spacing (e.g., 0.10 m) to normalize controller lookahead behavior.
-- Heading continuity: unwrap yaw to remove 2π discontinuities; low-pass filter yaw to reduce micro-jitter.
-- Curvature cleanup: remove spike outliers (e.g., Savitzky–Golay on coordinates or curvature), then re-resample.
+**V2 — Smoothing + heading normalization (stability)**
+- Resample to uniform spacing (e.g., Δs=0.10 m); unwrap yaw; low-pass yaw; SG or spline for curvature cleanup.
 
-V3 — Connectivity & loop validation (track completeness)
-- On split-join regions, verify that chosen pairs allow **closed-loop traversal** without kinematic dead-ends.
-- Introduce a “return-to-nominal” test: successful traverse from X→Y and back through the designed network without violating curvature limits.
+**V3 — Connectivity & loop validation (track completeness)**
+- Verify closed-loop traversal and no kinematic dead-ends; add “return-to-nominal” test (X→Y and return) under curvature limits.
 
 Result: A repeatable pipeline that yields smooth, controller-friendly, and mutually compatible segments.
 
 ---
 
-## 2) How to Use (Operator Workflow)
+## 2) Operator Workflow (How to Use)
 
-1) Define **semantic nodes** on the map (split, corner entry/exit, stop, pickup/dropoff, etc.).  
-   Store node indices and (x, y) anchors in a small config file.
+1) Define **semantic nodes** on the map (split, corner entry/exit, stop, pickup/dropoff). Store node indices and `(x, y)` anchors.
 
 2) For each **directed pair** X→Y:
-   - Run RRT **N** times; collect successful paths (polyline sequences).
-   - Evaluate, filter, and smooth; enforce uniform spacing (e.g., Δs = 0.10 m).
-   - Persist champion to `waypoints_XtoY.json`.
+   - Run RRT **N** times; collect successful candidate polylines.
+   - Evaluate, filter, and smooth; enforce uniform spacing (e.g., Δs=0.10 m).
+   - Persist the **champion** to `waypoints_XtoY.json` and save a `waypoints_XtoY.meta.json` sidecar.
 
-3) Naming convention  
-   `waypoints_13to21.json` → path from node 13 to node 21.
+3) Naming convention: `waypoints_13to21.json` → path from node 13 to node 21.
 
-4) Storage format (JSON; meters in the map plane)  
-   Example content (shown as plain text):
-     [[0.10, 0.20], [0.60, 0.30], [1.10, 0.40], ...]
+4) Storage format: JSON list of `[x, y]` points (meters) plus optional `frame_id` (defaults to `map`). See §6.
 
-5) Recommended RRT parameters (typical starting points)
-- step_size: 0.20 m
-- goal_sample_rate: 0.10–0.20
-- max_iter: ≥ 1000 (increase for narrow passages)
-- path_resolution: 0.10 m (post-smoothing resample target)
-- collision_check_fn: map-aware clearance function (see §7)
+5) Typical RRT parameters:
+- `step_size`: 0.20 m
+- `goal_sample_rate`: 0.10–0.20
+- `max_iter`: ≥ 1000 (increase for narrow passages)
+- `path_resolution`: 0.10 m (post-smoothing resample target)
+- `collision_check_fn`: map-aware clearance (see §7)
 
 ---
 
-## 3) Algorithm Details (What We Actually Do)
+## 3) Algorithm (What We Actually Do)
 
-Node Pair Expansion (per X→Y)
-- Seeding: set RNG seeds (multiple seeds per pair for coverage) and bounds for sampling.
-- RRT Loop:
-  - Sample a point; with probability goal_sample_rate, sample around Y to bias progress.
-  - Extend the nearest tree node toward the sample by step_size while collision-checking.
-  - If within goal tolerance of Y, backtrack the tree to form a path.
-- Path Formatting:
-  - Densify polyline to target spacing (linear interpolation at Δs).
-  - Optional shortcutting: attempt to replace small subsections with straight segments when collision-free.
-  - Smoothing: either cubic-spline through anchor subsets, Bézier fragment stitching, or coordinate-wise Savitzky–Golay (window 9–21, poly 2–3).
-- Curvature Computation:
-  - For discrete points P_i = (x_i, y_i) sampled at equal arc length s, estimate curvature κ_i by finite differences of yaw or by discrete Frenet:
-      κ_i ≈ |(x' y'' − y' x'')| / ( (x'^2 + y'^2)^(3/2) ), using centered differences.
-  - Compute metrics: average κ̄, peak κ_max, and curvature jerk proxy Δκ/Δs.
-- Heading Continuity:
-  - Compute yaw_i = atan2(Δy, Δx), then unwrap; low-pass filter to remove flicker.
-- Scoring (see §4) and selection.
+**Node Pair Expansion (per X→Y)**
+- **Seeding**: set RNG seeds (multiple per pair) and sampling bounds.
+- **RRT loop**:
+  1. Sample a point; with prob. `goal_sample_rate`, sample in a neighborhood of Y.
+  2. Extend nearest node toward the sample by `step_size` with collision checks.
+  3. On goal reach, backtrack and export a raw polyline.
+
+**Path formatting**
+- Densify to target spacing (linear interpolation at Δs).
+- **Shortcutting**: try straight-line replacements for small segments when collision-free.
+- **Smoothing**: cubic spline or Bézier fragments; or coordinate-wise **Savitzky–Golay** (window 9–21, poly 2–3).
+
+**Curvature & heading**
+- Equal-arc sampling ensures stable estimates. For \( P_i=(x_i,y_i) \):
+  - \( \kappa_i \approx |x' y'' - y' x''| / (x'^2 + y'^2)^{3/2} \) via centered differences.
+  - `yaw_i = atan2(Δy, Δx)` → unwrap → (optional) low-pass.
+
+**Metrics**
+- Length **L**, mean curvature **κ̄**, peak curvature **κ_max**, jerk proxy **Δκ/Δs**, min/avg clearance, continuity penalties.
+
+**Scoring**
+- See §4 for the composite score and normalization.
 
 ---
 
-## 4) Quality Criteria and Scoring
+## 4) Quality Criteria & Scoring
 
-We score each candidate by a weighted composite:
+Composite score for candidate ranking:
+```
+S = w_L·norm(L) + w_kbar·norm(κ̄) + w_kmax·norm(κ_max)
+  + w_cont·P_cont + w_clear·P_clear + w_smooth·P_smooth
+```
+**Terms**
+- `L`: total length (short is good, but allow gentle detours that reduce κ_max).
+- `κ̄`, `κ_max`: average and worst curvature (bounded by vehicle limits).
+- `P_cont`: continuity penalty (heading jumps/discontinuities).
+- `P_clear`: clearance penalty (distance to inflated obstacles).
+- `P_smooth`: jerk penalty ∝ mean |Δκ/Δs|.
 
-S = w_L · norm(L) + w_k̄ · norm(κ̄) + w_kmax · norm(κ_max) + w_cont · P_cont + w_clear · P_clearance + w_smooth · P_smooth
+**Normalization**
+- Per pair X→Y, min-max normalize each metric across candidates to [0,1].
 
-Where:
-- L: total path length (shorter is generally better, but do not penalize gentle detours that reduce κ_max).
-- κ̄: average curvature; κ_max: worst-case curvature (bounded by vehicle limits).
-- P_cont: continuity penalty (heading jumps, position discontinuities).
-- P_clearance: penalty for near-obstacle segments (smaller clearance → larger penalty).
-- P_smooth: penalty proportional to curvature jerk Δκ/Δs.
+**Thresholds (defaults)**
+- `κ_max ≤ 0.25–0.35 1/m` (vehicle-dependent).
+- |Δκ/Δs| below controller’s steering-rate comfort.
+- `clearance_min ≥ 0.20–0.30 m` from inflated obstacles.
 
-Normalization:
-- Normalize each metric per pair X→Y using min-max across the candidate set to obtain comparable scales.
-
-Thresholds (example defaults; adapt to your platform):
-- κ_max ≤ 0.25–0.35 1/m (depends on min turning radius).
-- Δκ/Δs capped at a comfortable steering rate for your controller.
-- Clearance ≥ 0.20–0.30 m from static obstacles.
-
-Selection:
-- Keep top-k% (e.g., 10–20%) for manual review; typically select the **single best** for production and keep **2 backups**.
+**Selection**
+- Keep top `k%` (10–20%) for review; select **one champion** and keep **2 backups**.
 
 ---
 
 ## 5) Output Normalization (Why Controllers Love It)
 
-Uniform spacing
-- Resample to a fixed Δs so that controllers with fixed lookahead rely on predictable geometry.
-
-Monotone progress
-- Ensure cumulative arc length s is strictly increasing; no backtracking segments.
-
-Heading and yaw rate
-- Enforce yaw continuity; limit |Δyaw| between consecutive samples to suppress micro-oscillations.
-
-Endpoint contracts
-- Start tangent should roughly align with the incoming node’s expected heading; we optionally pin the first 2–3 samples to ensure a clean hand-off across segments.
+- **Uniform spacing**: resample to fixed Δs so fixed-lookahead controllers see predictable geometry.
+- **Monotone progress**: strictly increasing arc length; no backtracking segments.
+- **Heading continuity**: unwrap yaw; limit |Δyaw| per sample; bound curvature.
+- **Endpoint contracts**: align start tangent with upstream node heading; optionally pin first/last 2–3 samples.
 
 ---
 
-## 6) Parameter Tuning Guide
+## 6) JSON Schemas & Examples
 
-Core RRT knobs
-- step_size: too small → slow convergence, jaggy; too large → poor clearance. Start at 0.20 m; sweep 0.10–0.30.
-- goal_sample_rate: higher accelerates convergence but can cause “bee-lining” through tight spaces; 0.10–0.20 works well.
-- max_iter: scale with corridor width; narrow passages may require 3000–5000.
 
-Smoothing knobs
-- Resample Δs: 0.05–0.15 m depending on controller frequency and speed.
-- Savitzky–Golay window (odd): 9–21; poly order 2–3.
-- Spline tension: small to avoid overshoot; keep curvature bounded.
-
-Scoring weights (example starting set)
-- w_L = 1.0, w_k̄ = 2.0, w_kmax = 4.0, w_cont = 2.0, w_clear = 3.0, w_smooth = 2.0.
-
-Grid search
-- Run small sweeps of (step_size, goal_sample_rate, weights) per “difficult” pair and log the Pareto front.
+### 6.1 `waypoints_XtoY.json`
+```json
+{
+  "frame_id": "map",
+  "points": [[0.10, 0.20], [0.60, 0.30], [1.10, 0.40]],
+  "spacing_m": 0.10
+}
+```
 
 ---
 
-## 7) Collision Environment and Clearance
+## 7) Collision Environment & Clearance
 
-Map model
-- Use a 2D occupancy / polygon map aligned to the same coordinate frame as waypoints.
-- Inflate static obstacles by the vehicle half-width + a safety margin.
+**Map model**
+- 2D occupancy or polygonal map aligned to `map`. Inflate obstacles by vehicle half-width + safety margin.
 
-Collision check function
-- For a segment (p_i → p_{i+1}), discretize at ≤ 0.5·step_size and test against inflated obstacles.
-- For speed, precompute a distance field over the map; reject points with distance < clearance_min.
+**Collision check**
+- For segment `(p_i → p_{i+1})`, discretize at ≤ `0.5·step_size`; reject points with `distance < clearance_min`.
+- Precompute a **distance field** for speed; cache it on disk keyed by map revision.
 
-Clearance scoring
-- Along each candidate, accumulate minimum distance to obstacles; penalize segments that graze boundaries.
-
----
-
-## 8) Reproducibility, Determinism, and Caching
-
-Randomness control
-- Record RNG seed per candidate; store in metadata for exact replay.
-
-Version pinning
-- Log library versions (NumPy, your geometry libs, Python) and map revision.
-
-Cache artifacts
-- Keep intermediate candidate polylines, not only champions, for later audits.
-
-Metadata sidecar (YAML or JSON)
-- Save: X, Y indices; seed; L, κ̄, κ_max; min clearance; timestamps; chosen parameters; score components.
+**Clearance scoring**
+- Accumulate minimum/average distance along the candidate; penalize boundary grazes.
 
 ---
 
-## 9) Directory Layout (Suggested)
+## 8) Parameters
 
-rrt/  
-├─ README.md  
-├─ configs/  
-│  ├─ nodes.yaml                (node indices, anchor coordinates)  
-│  └─ rrt_params.yaml           (defaults per track or per pair)  
-├─ maps/                        (track map, inflated obstacles, distance field)  
-├─ scripts/                     (generators, evaluators, visualizers)  
-├─ candidates/                  (optional cache of raw candidates)  
-├─ outputs/  
-│  ├─ waypoints_13to21.json     (champion per pair)  
-│  └─ ...  
-└─ rrt_logs/  
-   ├─ rrt_eval_YYYYMMDD.csv     (metrics & reasons for selection)  
-   └─ rrt_debug/                (per-candidate diagnostics)
+| Group | Parameter | Type | Default | Notes |
+|---|---|---|---:|---|
+| rrt | `step_size` | float | 0.20 | Extension step (m).
+| rrt | `goal_sample_rate` | float | 0.15 | Goal bias probability.
+| rrt | `max_iter` | int | 2000 | Increase for narrow passages.
+| format | `resample_ds` | float | 0.10 | Uniform spacing target (m).
+| smooth | `sg_window` | int | 15 | Odd, 9–21 typical.
+| smooth | `sg_poly` | int | 3 | 2–3 typical.
+| limits | `kappa_max` | float | 0.30 | 1/m; cap in smoothing/selection.
+| limits | `clearance_min` | float | 0.30 | Meters; inflated obstacles.
+| scoring | `w_L` | float | 1.0 | Length weight.
+| scoring | `w_kbar` | float | 2.0 | Mean curvature weight.
+| scoring | `w_kmax` | float | 4.0 | Peak curvature weight.
+| scoring | `w_cont` | float | 2.0 | Continuity penalty weight.
+| scoring | `w_clear` | float | 3.0 | Clearance penalty weight.
+| scoring | `w_smooth` | float | 2.0 | Jerk penalty weight.
+
 
 ---
 
-## 10) Logging and Evaluation (CSV Schema)
+## 9) Reproducibility, Determinism, & Caching
 
-CSV columns (example)
-- pair_id, X, Y  
-- seed, step_size, goal_sample_rate, max_iter  
-- length_m, curv_avg, curv_max, curv_jerk_avg  
-- clearance_min, clearance_avg  
-- heading_jump_penalty, smooth_penalty, continuity_penalty  
-- score_total, rank, selected_flag  
-- notes (free-text; e.g., “tight chicane; spline t=0.3”)
-
-Why log this much?
-- Post-mortems are faster; when a path feels “nervous,” you can correlate with curvature jerk or heading penalties.
+- **Randomness control**: record RNG seed per candidate; store in sidecar.
+- **Version pinning**: log NumPy/Python versions and **map revision**.
+- **Caching**: keep raw candidate polylines for audits; store per-pair CSV logs (see §10).
 
 ---
 
-## 11) Visualization and QA
+## 10) Integration with Planning
 
-Sanity plots
-- Plot x-y polylines over the map with obstacle inflation shown.
-- Plot yaw vs. arc length; curvature vs. arc length; mark κ_max.
-- Compare champion vs. runner-ups for a pair (X→Y).
+**Contracts**
+- Each `waypoints_XtoY.json` uses the **same frame** as the planner (`map`) and **meters** as units.
+- Sampling density should match runtime lookahead (`Δs ≈ v / f_ctrl`).
 
-Controller-in-the-loop checks
-- Feed the normalized polylines into your low-level controller in simulation; inspect steering rate and cross-track error envelopes.
+**Streaming**
+- `helper_path_sender` reads `dqn_paths.json`, loads `waypoints_*` for each hop, and **streams** (no reach gating) to `/planned_path` (and legacy `/path_x`, `/path_y`).
 
-Continuity at junctions
-- Visualize hand-offs node-to-node (…→ X→Y → …) to ensure tangent continuity and no lateral jumps.
-
----
-
-## 12) Integration with Planning
-
-Contracts
-- Each `waypoints_XtoY.json` must use the **same frame** as the planner (`map` or track plane) and **meters** as units.
-- Sampling density should match runtime lookahead (e.g., Δs ≈ v / f_ctrl).
-
-Streaming
-- `helper_path_sender` reads `dqn_paths.json` (global node sequence), loads the associated `waypoints_*` for each hop, and **streams** (no reach gating) to `/path_x`, `/path_y`.
-
-Boundaries and avoidance
-- At ID boundaries, the Obstacle_Avoidance module **merges current+next** to compute offsets, ensuring continuous rejoin.
+**Boundaries & avoidance**
+- At ID boundaries, Obstacle_Avoidance **merges current+next** before computing offsets for a continuous rejoin.
 
 ---
 
-## 13) Failure Modes and Remedies
+## 11) Failure Modes & Remedies
 
-Failure mode: jaggy micro-turns on straights  
-- Cause: uneven spacing or spline overshoot.  
-- Fix: re-resample; lower spline tension; apply SG filter before resampling.
+| Failure mode | Cause | Fix |
+|---|---|---|
+| Jaggy micro-turns on straights | Uneven spacing or spline overshoot | Re-resample; lower spline tension; SG before resampling. |
+| κ_max exceeds vehicle limits | Aggressive smoothing / insufficient samples | Enforce curvature cap in scoring; allow slightly longer path lowering κ_max. |
+| Poor clearance near apex | Goal bias cuts too close | Inflate obstacles more; add mid-way anchors; penalize small clearance. |
+| Heading jump at start/end | Endpoint misalignment | Pin first/last tangents; end-segment smoothing over last 3–5 points. |
 
-Failure mode: κ_max exceeds vehicle limits in tight corners  
-- Cause: insufficient sampling or aggressive smoothing.  
-- Fix: enforce curvature cap in scoring; allow slightly longer path that lowers κ_max.
-
-Failure mode: poor clearance near inner apex  
-- Cause: RRT goal bias cutting too close.  
-- Fix: inflate obstacles more; add mid-way anchor(s); penalize small clearance in scoring.
-
-Failure mode: heading jump at the start/end  
-- Cause: segment endpoints not aligned with adjacent segments.  
-- Fix: pin first/last tangents; perform end-segment smoothing over last 3–5 points.
-
-
+---
 
