@@ -1,4 +1,4 @@
-# Perception Module — Process-Centric README (Revised)
+# Perception Module
 
 This directory documents the **full perception stack** for our autonomous vehicle. The stack consists of **SCNN-based lane detection** and **YOLOv7-based object detection**, driven by **Intel RealSense D435i RGB + Depth**. All outputs are expressed in **metric 3D coordinates** and consumed by **Planning / Control / ROS2** for path generation, FSM transitions, and avoidance decisions.
 
