@@ -1,4 +1,4 @@
-# SCNN-based Lane Detection — Process-Centric README (Revised)
+# SCNN-based Lane Detection
 
 This module ports a paper-based **Spatial CNN (SCNN)** to a **640×480, real-vehicle** setup and adds post-processing to generate a **3D lane centerline** consumed by Planning/Control. The system fuses **RGB + Depth** from Intel RealSense D435i and compares the vision-based centerline with **Cartographer SLAM** for drift monitoring and mitigation.
 
