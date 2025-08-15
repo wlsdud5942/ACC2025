@@ -1,4 +1,4 @@
-# ROS2 README
+# ROS 2 (Humble) — End‑to‑End Stack README (Revised, Process‑Centric)
 
 End-to-end ROS 2 (Humble) stack that connects **Perception (SCNN / YOLOv7)**, **Planning (RRT / DQN / Path Sender)**, **Control (FSM; Simulink codegen)**, **Obstacle Avoidance**, and **SLAM (Cartographer)** on the real vehicle (QCar2).  
 The design emphasizes **timing robustness**, **deterministic handshakes**, and **simple, well-documented topic contracts**.
@@ -8,7 +8,7 @@ The design emphasizes **timing robustness**, **deterministic handshakes**, and *
 ## 0) Goals & Design Constraints
 
 **Goals**
-- Build a **reproducible** on-vehicle pipeline across perception → planning → control → avoidance/SLAM.
+- Build a **reproducible** on-vehicle pipeline from perception → planning → control → avoidance/SLAM.
 - Keep synchronization between Python ROS 2 nodes and **Simulink-generated C++ FSM** **stable and observable**.
 - Stream waypoints **without distance-based reach checks**; use **explicit events** for stop/pickup and other transitions.
 
@@ -19,143 +19,147 @@ The design emphasizes **timing robustness**, **deterministic handshakes**, and *
 
 ---
 
-## 1) Problem Definition → Hypotheses
+## 1) Problem → Hypotheses → Outcomes
 
 **Observed problems**
 1. **FSM desync**: Distance-based “reach triggers” caused ordering/latency mismatches with the Simulink FSM.  
-2. **Boundary fragility**: At path-ID boundaries, perception/SLAM/planning events did not align → failed hand-offs.  
+2. **Boundary fragility**: At path‑ID boundaries, perception/SLAM/planning events did not align → failed hand‑offs.  
 3. **SLAM drift**: Cartographer accumulates small drift over long runs.
 
-**Hypotheses**
-- **(G1)** Stream waypoints strictly on a **timer** and drive FSM transitions with **explicit event topics** → fewer desyncs.  
-- **(G2)** Treat **transitions** as **continuous curves** (avoid artificial ID boundaries) in perception/avoidance/planning.  
-- **(G3)** Compare **SCNN 3D centerline** to **SLAM pose** to monitor and mitigate long-term drift.
+**Hypotheses & Outcomes**
+- **(G1)** Stream waypoints strictly on a **timer** and drive FSM transitions with **explicit event topics** → fewer desyncs. **(Observed: success)**  
+- **(G2)** Treat **transitions** as **continuous curves** (avoid artificial ID boundaries) in perception/avoidance/planning → smoother hand‑offs. **(Observed: success)**  
+- **(G3)** Compare **SCNN 3D centerline** to **SLAM pose** to monitor and mitigate long‑term drift → early detection/reset hooks. **(Observed: success)**
 
 ---
 
-## 2) Attempts → Failures → Improvements
-
-- **V0 — Distance-based “reach trigger” (failed)**  
-  Switch at segment endpoints using pose distance.  
-  → Result: FSM event ordering jitter; misbehavior under latency.
-
-- **V1 — Time-based streaming (success)**  
-  `HelperPathSender` streams `/path_x`, `/path_y` on a fixed timer; FSM changes state using explicit events.  
-  → Result: Synchronization & repeatability improved markedly.
-
-- **V1.1 — SCNN-ROI assisted switching (optional)**  
-  `PathSenderNode` can use SCNN centerline ROI for next-segment switching (Cartographer ROI as backup).  
-  → Result: More stable transitions at boundaries.
-
-- **V2 — Cartographer integration & drift monitoring**  
-  Unified TF/time across Docker and host. Compare SCNN centerline vs SLAM pose; add alert/reset hooks.  
-  → Result: Early drift detection and simpler recovery.
-
----
-
-## 3) Current Architecture (Overview)
+## 2) Architecture Overview
 
 - **Perception**
-  - **SCNN**: lane mask → **centerline (3D)**.
-  - **YOLOv7**: objects/stop-line → `/obstacle_info`, `/yolo_stop`.
+  - **SCNN**: RGB → lane mask → **centerline (3D)**.
+  - **YOLOv7**: RGB(+Depth) → objects/stop‑line → `/obstacle_info`, `/yolo_stop`.
 
 - **Planning**
   - **Offline**: `rrt/` → `waypoints_*.json`; `dqn/` → `dqn_paths.json`.  
   - **Online**:  
-    - `HelperPathSender`: time-based waypoint streaming from **DQN total sequence**.  
-    - `PathSenderNode`: SCNN-ROI–assisted segment switching (alternative).
+    - `HelperPathSender`: time‑based waypoint streaming from **DQN total sequence**.  
+    - `PathSenderNode` (optional): SCNN‑ROI–assisted segment switching.
 
 - **Obstacle Avoidance**
-  - Lateral **offset-curve** over **merged (current+next) path**; gates base stream while active.  
+  - Lateral **offset‑curve** over **merged (current+next) path**; **gates** base stream while active.  
   - Emits `/avoid_start`, `/avoid_done`; streams temporary avoidance waypoints.
 
 - **Control (FSM)**
-  - Simulink **code-generated C++** node; consumes `/stop`, `/pickup_dropoff`, `/path_mode` and follows streamed waypoints.
+  - Simulink **code-generated C++** node; consumes `/stop`, `/pickup_dropoff`, `/path_mode`; follows streamed waypoints.
 
 - **SLAM**
-  - **Cartographer 2D** (LiDAR + IMU), `use_sim_time`, custom TF broadcaster for `base_link ↔ laser`.
----
-
-## 4) Interface Contracts (Summary)
-
-| Module                | Inputs                                     | Outputs                                                                | Notes |
-|-----------------------|---------------------------------------------|------------------------------------------------------------------------|-------|
-| **Perception**        | `/camera/*`                                 | `/lane_mask`, `/centerline_3d`, `/obstacle_info`, `/yolo_stop`         | Keep `frame_id` / `stamp` consistent |
-| **HelperPathSender**  | `/dqn_done`, `/location`                    | `/path_x`, `/path_y`, `/path_mode`, `/stop`, `/pickup_dropoff`         | **No reach checks** (time-based streaming) |
-| **PathSenderNode**    | `/location`, `/lane_detection/*`            | `/path_x`, `/path_y`, `/path_mode`                                     | Uses SCNN ROI–assisted switching |
-| **ObstacleAvoidance** | `/obstacle_info`, `/location`               | `/path_x`, `/path_y`, `/avoid_start`, `/avoid_done`                    | **Gate** base stream while avoidance is active |
-| **Control (FSM)**     | `/path_x`, `/path_y`, `/stop`, `/pickup_dropoff` | `/cmd`                                                              | Simulink C++ codegen node |
-
-**QoS guidance**
-- **Sensors/images**: `SensorDataQoS` (best effort, low latency).  
-- **Control/events**: `reliable` + `keep_last(N)`; consider **`transient_local`** for events that must survive restarts.  
-- **`/tf_static`**: `reliable` + `transient_local`.
+  - **Cartographer 2D** (LiDAR + IMU); TF: `map → odom → base_link → sensors`.
 
 ---
 
-## 5) Simulink → ROS 2 Codegen
+## 3) Interface Matrix (Topics & QoS)
 
-**Why codegen?** Speed of tuning + reproducibility with a deterministic controller.
-
-**How**
-1. Build the controller FSM in Simulink with **ROS 2 Pub/Sub** blocks.  
-2. Generate a C++ node via **`slros2`** toolbox.  
-3. Add to the ROS 2 workspace; `colcon build`.
-
-**Key lesson**  
-Remove distance-based reach logic from Simulink. Make transitions **event-driven** only (`/stop`, `/pickup_dropoff`, `/path_mode`). Let ROS 2 nodes **stream** waypoints on a timer.
-
----
-
-## 6) Time Sync & TF Discipline
-
-- Use **`use_sim_time=true`** consistently when `/clock` is present.  
-- For **Docker ↔ host** mixes, run a **TF broadcaster** to pin frames & timestamps (e.g., publish `base_link ↔ laser`).  
-- Publish **`/tf_static`** with **`transient_local + reliable`** so restarts recover geometry.  
-- Prefer **hardware timestamps**; otherwise normalize to a single clock and document offsets.
+| Module | Subscriptions | Publications | QoS (suggested) | Notes |
+|---|---|---|---|---|
+| **SCNN** | `/camera/color/image_raw`, `/camera/aligned_depth_to_color/image_raw` | `/lane_mask`, `/centerline_path` (std), `/centerline_3d` (legacy) | Sensors: SensorData (best_effort); Outputs: reliable, keep_last(10) | `frame_id` from color optical; outputs default `base_link` |
+| **YOLOv7** | `/camera/color/image_raw`, `/camera/aligned_depth_to_color/image_raw` | `/objects_3d` (legacy), `/detections_3d` (std, optional), `/yolo_stop` | Sensors: SensorData; Outputs/Events: reliable, keep_last(10) | Depth windowed median; publish meters |
+| **HelperPathSender** | `/dqn_done`, `/location` | `/planned_path` (std), `/path_x`, `/path_y`, `/path_mode`, `/stop`, `/pickup_dropoff` | reliable, keep_last(10); events optionally `transient_local` | **Time‑based streaming** (no distance gating) |
+| **PathSenderNode** | `/location`, `/lane_mask` or centerline ROI | `/planned_path` (std), `/path_x`, `/path_y`, `/path_mode` | reliable, keep_last(10) | ROI‑assisted segment switching |
+| **ObstacleAvoidance** | `/obstacle_info`, `/location` | `/avoid_start`, `/avoid_done`, avoidance `/planned_path` or `/path_x/y` | Events: reliable + transient_local; paths: reliable | **Gate** base stream when active |
+| **FSM (Simulink)** | `/planned_path` or `/path_x/y`, `/stop`, `/pickup_dropoff`, `/path_mode` | `/cmd` | reliable, keep_last(10) | Event‑driven only |
+| **SLAM (Cartographer)** | sensor topics, `/clock` (if bag) | `/tf`, `/tf_static`, `/map` | `/tf_static`: reliable + transient_local | Maintain single clock domain |
 
 ---
 
-## 7) Logging & Monitoring
+## 4) Frames & Time Discipline
 
-- **Drift**: lateral error between **centerline** and **SLAM pose** → `logs/slam_drift.csv`.  
-- **Streaming**: segment indices, timestamps, count of published points.  
-- **Events**: audit trail for `/stop`, `/pickup_dropoff`, `/avoid_start`, `/avoid_done`.  
-- **Run manifest**: capture QoS profiles & clock source at startup → `logs/run_meta.yaml`.
-
----
-
-## 8) Directory Layout
-
-```
-ros2/
-├─ README.md
-├─ perception/
-├─ planning/
-│  ├─ rrt/                      # offline segment generation
-│  ├─ dqn/                      # visit-order planner
-│  └─ nodes/
-│     ├─ helper_path_sender.py
-│     └─ path_sender_node.py
-├─ obstacle_avoidance/
-│  └─ waypoint_generator.py
-├─ control/                     # Simulink codegen package
-└─ slam/
-   ├─ cartographer_configs/
-   └─ tf_broadcaster/
-```
+- **Frames**: `map` (global), `odom` (continuous local), `base_link` (vehicle), `camera_*_optical_frame`.  
+- **TF Tree**: `map → odom → base_link → {camera, lidar, imu}`.  
+- **/tf_static**: publish with **reliable + transient_local** so restarts recover geometry.  
+- **Clock**:  
+  - **Live**: `use_sim_time=false`; prefer hardware time from devices.  
+  - **Bag**: `use_sim_time=true`; launch a `/clock` provider before anything else.  
+- **Docker/host mixes**: pin NTP/chrony; avoid multiple `/clock` sources; document offsets in the run manifest.
 
 ---
 
-## 9) Known Issues & Mitigations
+## 5) Bring‑Up Runbooks
 
-| Issue                           | Mitigation |
-|---------------------------------|------------|
-| FSM/event jitter (legacy reach-trigger) | Use **time-based streaming**; drive FSM via **explicit events** only. |
-| Boundary hand-off glitches      | Operate on **merged (current+next) paths**; avoid ID-local assumptions. |
-| Cartographer drift              | Monitor **centerline vs pose**; provide alert/reset hooks; maintain time/TF discipline. |
-| Missed events after restarts    | Use **`transient_local`** QoS for critical events; small `keep_last(N)` buffers. |
-| Mixed Docker/host timestamps    | Single source of truth for `/clock`; normalize stamps at bridges; verify `frame_id` consistency. |
+### A) Cold start (on vehicle)
+1. Launch TF static + SLAM (or TF static only if no SLAM):  
+   ```bash
+   ros2 launch slam cartographer.launch.py use_sim_time:=false
+   ```
+2. Perception (SCNN, YOLOv7) in one composition or separate terminals.  
+3. Planning offline artifacts present: `rrt/outputs/*`, `dqn/dqn_paths.json`.  
+4. Start `helper_path_sender` with `publish_nav_path:=true` (or `path_sender_node` if using ROI switching).  
+5. Start **FSM** (Simulink codegen): ensure it listens to `/stop`, `/pickup_dropoff`, `/path_mode` and consumes `/planned_path` or `/path_x/y`.
+
+### B) Bag replay (diagnostics)
+1. `use_sim_time:=true`; start a `/clock` provider (`ros2 bag play --clock` or a minimal clock node).  
+2. Publish `/tf_static` first (transient_local).  
+3. Launch stack components; verify stamps increase with `/clock`.  
+4. Reproduce events and path streaming deterministically.
+
+### C) Partial stack (perception‑only or planning‑only)
+- Launch module + TF + a fake clock if needed. Use RViz overlays and record outputs for tuning.
+
+---
+
+## 6) Events, Gating, and Switching
+
+- **Streaming vs Events**: Path streaming is **timer/index‑based**; **never gated by distance**. FSM transitions are driven by **events** only.  
+- **Avoidance gating**: When `/avoid_start` fires, controllers should prioritize the avoidance path queue; resume base stream on `/avoid_done`.  
+- **Segment switching**: Prefer **index‑based** transitions in sender; optional ROI heuristics may assist but must not depend on noisy distance thresholds.
+
+---
+
+## 7) Global Parameters
+
+| Parameter | Type | Default | Notes |
+|---|---|---:|---|
+| `output_frame_id` | string | `map` | Global path frame (static track). Use `base_link` only for short local segments. |
+| `timer_hz` | float | 2.0 | HelperPathSender streaming rate. |
+| `window_size` | int | 4 | Sliding window for path streaming. |
+| `events_transient_local` | bool | true | Make events survive restarts. |
+| `use_sim_time` | bool | false | Set `true` for bag replay. |
+| `drift_e_thresh_m` | float | 0.25 | Centerline vs SLAM cross‑track error threshold. |
+
 
 
 ---
+
+## 8) Logging & Monitoring
+
+- **Run manifest** (`logs/run_meta.yaml`): record clock source, QoS choices, frames, package versions.  
+- **Drift** (`logs/slam_drift.csv`): timestamp, e_perp, decision, pose source.  
+- **Streaming**: segment index, published count, timer periods.  
+- **Events**: `/stop`, `/pickup_dropoff`, `/avoid_start`, `/avoid_done` with timestamps.
+
+---
+
+## 9) Troubleshooting
+
+| Symptom | Likely Cause | Fix |
+|---|---|---|
+| FSM/event jitter | Legacy reach‑trigger logic still in use | Remove distance gating; events only. |
+| Boundary hand‑off glitch | ID‑local assumptions | Merge current+next path for transitions; use ROI assist. |
+| Drift accumulates | Time/TF inconsistency | Enforce single clock; monitor centerline vs pose; provide reset hooks. |
+| Missed events after restarts | Volatile QoS | Use `transient_local` for critical events. |
+| Mixed Docker/host time | Multiple `/clock` providers | Keep a single `/clock`; document offsets in run manifest. |
+
+---
+
+## 10) Version Matrix
+
+| Component | Tested Version |
+|---|---|
+| ROS 2 | Humble |
+| RealSense | librealsense 2.x (aligned depth enabled) |
+| PyTorch (YOLOv7 optional) | 1.12.x (Jetson FP16) |
+| Cartographer | cartographer_ros latest for Humble |
+| Simulink ROS 2 toolbox | slros2 (matching Humble msgs) |
+
+
+---
+
