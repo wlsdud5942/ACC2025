@@ -1,4 +1,4 @@
-# RRT — Offline Path Set Generation (Revised, Process-Centric)
+# RRT
 
 This module builds a **high-quality set of offline paths** for a **static track**. Instead of computing paths online, we repeatedly run **RRT** (dozens to thousands of trials per node pair X→Y), evaluate each candidate by **length / curvature / continuity / clearance**, smooth and resample it, and persist only the **best** as `waypoints_XtoY.json`. These curated segments are later stitched (via `dqn_paths.json`) and streamed at runtime by the planning stack.
 
