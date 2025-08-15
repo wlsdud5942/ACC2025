@@ -1,4 +1,4 @@
-# ROS 2 (Humble) — End‑to‑End Stack README (Revised, Process‑Centric)
+# ROS 2 
 
 End-to-end ROS 2 (Humble) stack that connects **Perception (SCNN / YOLOv7)**, **Planning (RRT / DQN / Path Sender)**, **Control (FSM; Simulink codegen)**, **Obstacle Avoidance**, and **SLAM (Cartographer)** on the real vehicle (QCar2).  
 The design emphasizes **timing robustness**, **deterministic handshakes**, and **simple, well-documented topic contracts**.
