@@ -1,6 +1,6 @@
-# SCNN-based Lane Detection 
+# SCNN-based Lane Detection — Process-Centric README (Revised)
 
-This module ports a paper-based **Spatial CNN (SCNN)** to a **640×480, real-vehicle** setup and adds post-processing to generate a **3D lane centerline** used by Planning/Control. The system fuses **RGB + Depth** from Intel RealSense D435i and compares the vision-based centerline with **Cartographer SLAM** for drift monitoring and mitigation.
+This module ports a paper-based **Spatial CNN (SCNN)** to a **640×480, real-vehicle** setup and adds post-processing to generate a **3D lane centerline** consumed by Planning/Control. The system fuses **RGB + Depth** from Intel RealSense D435i and compares the vision-based centerline with **Cartographer SLAM** for drift monitoring and mitigation.
 
 ---
 
@@ -11,117 +11,143 @@ This module ports a paper-based **Spatial CNN (SCNN)** to a **640×480, real-veh
 
 ---
 
-## 2) Original SCNN Issues and Our Modifications
+## 2) Frames & Calibration
 
-Item | Original Limitation | Our Modification
---- | --- | ---
-Input size | Fixed at 295×128 | Support **640×480** (resize while preserving aspect; adjusted upsampling)
-Output format | 4-channel soft labels | **Single-channel binary mask** (0/255) for simpler post-processing
-Inference script | Hardcoded file paths | **ROS2 node I/O**: subscribes to images, publishes mask/centerline
+**Frames**
+- **Camera (RealSense optical)**: x→right, y→down, z→forward (RealSense convention).
+- **Vehicle (base_link)**: x→forward, y→left, z→up.
+- **Extrinsics**: fixed transform \(T^{\text{camera}}_{\text{base\_link}}\) via TF (`static_transform_publisher`).
 
-Notes
-- Kept SCNN backbone/topology; changed pre/post transforms and output head to suit binary lane segmentation.
-- Ensured inference latency fits the real-time budget on the target device.
+**Calibration workflow**
+1. Measure intrinsics/extrinsics with a checkerboard (OpenCV).
+2. Register the static transform through `static_transform_publisher`.
+3. Verify alignment in RViz (overlay color/depth; project landmarks).
 
----
+**Depth alignment**
+- Prefer `/camera/aligned_depth_to_color/image_raw` so RGB pixel `(u,v)` and depth share the same frame.
 
-## 3) Implementation
-
-### 3.1 Model Adaptation
-- Updated `model.py` and inference script (`test.py` or equivalent) to accept **640×480** inputs.
-- Adjusted decoder/upsample path so the lane mask aligns with camera intrinsics.
-- Directly produce a **binary mask** to simplify downstream clustering (no argmax over multi-channel logits).
-
-### 3.2 Post-processing Pipeline (Core)
-1) Row-wise **DBSCAN** to cluster lane pixels and suppress small noisy blobs.  
-2) **3rd-order polynomial fit** (polyfit) per cluster to model left/right lane curves.  
-3) Compute **centerline** as the mean of left/right fits at sampled rows (guarding for missing sides).  
-4) **Depth fusion** to obtain 3D points:
-   - Given pixel (u, v) with depth Z:
-     - X = (u − cx) / fx * Z
-     - Y = (v − cy) / fy * Z
-     - Z = Z
-   - Transform from camera to `base_link` using TF (T_base_link^camera).  
-5) **Temporal smoothing** of polynomial coefficients:
-   - EMA (exponential moving average) or Kalman filter on coefficients to stabilize across frames.
-
-Alternatives
-- Replace polyfit with **RANSAC polyfit** for stronger outlier rejection.  
-- Use **column-wise voting** or continuity penalties for robustness in occlusions/reflections.
-
-### 3.3 ROS2 Integration
-- Subscribe: `/camera/color/image_raw`, `/camera/depth/image_raw`.
-- Publish: `/lane_mask` (binary), `/centerline_3d` (Float32MultiArray as [x1,y1,z1, x2,y2,z2, ...], meters in `base_link`).
-- QoS: image topics `best_effort` or SensorDataQoS; post-processed topics `reliable, keep_last(10)`.
-- Frame/time: maintain consistent `frame_id`, use camera HW timestamps when possible.
+**Recommended storage**
+- `scnn/config/realsense_intrinsics.yaml` and `scnn/config/T_base_link_camera.yaml`.
 
 ---
 
-## 4) Cartographer Coupling (Drift Handling)
-- Compute lateral error e_y between the **vision centerline-based position** and **SLAM pose**.
-- If e_y exceeds a threshold (e.g., 0.2–0.3 m) consistently over a window, trigger **relocalization / map reset** logic.
-- Log to `logs/slam_drift.csv`: timestamp, e_y, decision, pose source.
+## 3) Sensors & Topics (contract)
+
+| Topic | Type | Frame | QoS | Notes |
+|---|---|---|---|---|
+| `/camera/color/image_raw` | `sensor_msgs/Image` | `camera_color_optical_frame` | SensorData (best_effort) | Encoding: `rgb8`/`bgr8`. |
+| `/camera/aligned_depth_to_color/image_raw` (preferred) or `/camera/depth/image_raw` | `sensor_msgs/Image` | `camera_color_optical_frame` (if aligned) | SensorData (best_effort) | `16UC1` (mm) or `32FC1` (m). Convert to meters. |
+| `/lane_mask` | `sensor_msgs/Image` | `camera_color_optical_frame` | Reliable, depth=5 | 8-bit single-channel (0/255), 640×480. |
+| `/centerline_path` (standard) | `nav_msgs/Path` | `base_link` or `map` | Reliable, depth=5 | Tangent yaw optional. |
+| `/centerline_3d` (legacy) | `std_msgs/Float32MultiArray` | `base_link` | Reliable, depth=10 | Flat `[x1,y1,z1, ...]` meters. |
+
+**Timestamping**
+- Derive all outputs’ `header.stamp` from the **camera image stamp** to preserve causality.
 
 ---
 
-## 5) Example Artifacts to Insert (placeholders)
-Step | What to show
---- | ---
-Input RGB | Example frame (day/night if available)
-SCNN mask | Binary lane mask (0/255) overlay on RGB
-DBSCAN + polyfit | Cluster visualization and fitted curves
-3D centerline | RViz capture of centerline in `base_link`
+## 4) Implementation
+
+### 4.1 Model Adaptation
+- Updated model/inference to accept **640×480** inputs (maintain aspect ratio; adjust decoder/upsample).
+- Output head produces a **binary mask** (0/255) rather than 4-channel soft labels.
+- Kept SCNN backbone/topology; changed pre/post transforms for our camera geometry.
+
+### 4.2 Post-processing Pipeline (Core)
+1. **Row-wise DBSCAN** clusters lane pixels; discard small blobs.
+2. **3rd-order polyfit** per cluster (left/right lanes).
+3. **Centerline** = mean of left/right polynomials at sampled rows; handle missing sides via last-valid carry and continuity penalty.
+4. **Depth fusion** (camera → base_link):
+   Given pixel `(u, v)` and depth `Z` (m):
+   ```
+   Xc = (u - cx)/fx * Z
+   Yc = (v - cy)/fy * Z
+   Zc = Z
+   ```
+   Transform to `base_link` via TF: `p_b = T_base_link_camera · [Xc, Yc, Zc, 1]^T`.
+5. **Temporal smoothing** of polynomial coefficients (EMA or Kalman). Optionally smooth the 3D centerline with a short cubic spline and resample at fixed arc-length for `/centerline_path`.
+
+**Alternatives**
+- Replace polyfit with **RANSAC polyfit** for stronger outlier rejection.
+- Add **column-wise continuity** or pairwise consistency checks for occlusion/reflection robustness.
+
+### 4.3 ROS2 Integration
+- **Subscribe**: RGB, aligned depth.
+- **Publish**: `/lane_mask`, `/centerline_path` (preferred), and legacy `/centerline_3d`.
+- **QoS**: images → SensorData; processed streams → Reliable `keep_last(10)`.
+- **Frames**: outputs default to `base_link`; use `map` if global consumers require it (apply SLAM pose).
 
 ---
 
-## 6) Performance, Limits, and Lessons
-- **Post-processing quality dominates**: clustering and curve fitting have the biggest impact on usable centerlines.
-- Challenging cases: low light, glare, lane wear. Mitigation: **median filtering** in mask space, coefficient smoothing, and continuity constraints.
-- Record metrics per scenario: **FPS / latency**, mask **IoU**, **centerline lateral error** vs ground truth or SLAM.
+## 5) Drift Monitor vs Cartographer
+
+- At time `t`, transform the centerline to `map` or transform SLAM pose to `base_link` consistently.
+- Choose a lookahead arc-length `L`; get the closest centerline point `p_L` and its tangent.
+- Compute **cross-track error** \(e_\perp\) from robot position to the tangent at `p_L`.
+- Maintain a sliding window of `e_⊥` (mean/std). If `mean(|e_⊥|) > e_thresh` for `T_window`, raise a diagnostic and optionally trigger **relocalization**.
+- Log `timestamp, e_perp, pose_source, decision` → `logs/slam_drift.csv`.
 
 ---
 
-## 7) Directory Layout (suggested)
-scnn/  
-├─ README.md  
-├─ models/              (SCNN definition, weights)  
-├─ scripts/             (inference node, utilities)  
-├─ configs/             (intrinsics/extrinsics, thresholds)  
-└─ logs/                (drift logs, per-frame diagnostics)
+## 6) Parameters
+
+| Group | Parameter | Type | Default | Notes |
+|---|---|---|---:|---|
+| general | `output_frame_id` | string | `base_link` | Output frame for centerline.
+| general | `sample_points` | int | 50 | Points along image-space centerline before 3D back-projection.
+| dbscan | `eps_px` | float | 3.0 | Pixel distance per row.
+| dbscan | `min_samples` | int | 30 | Suppresses small blobs.
+| poly | `order` | int | 3 | 2–3 typical.
+| poly | `ransac` | bool | false | Enable robust fit.
+| depth | `use_aligned_depth` | bool | true | Prefer aligned stream.
+| depth | `median_k` | int | 7 | Depth median window (odd).
+| smooth | `ema_alpha` | float | 0.3 | Coeff smoothing (lower = smoother).
+| smooth | `spline_smooth` | float | 0.1 | Spline smoothing for `/centerline_path`.
+| drift | `lookahead_m` | float | 2.0 | For cross-track error.
+| drift | `e_thresh_m` | float | 0.25 | Drift threshold.
+| drift | `T_window_s` | float | 3.0 | Window length.
+
 
 ---
 
-## 8) Message Contracts (examples)
-
-Topic | Type | Notes
---- | --- | ---
-/lane_mask | sensor_msgs/Image | 8-bit single-channel, 640×480, 0/255
-/centerline_3d | std_msgs/Float32MultiArray | Data = [x1,y1,z1, x2,y2,z2, ...], meters in `base_link`
-
-Validation tips
-- Check that centerline spacing along y (forward axis in `base_link`) is smooth and monotonic.  
-- Verify no sudden yaw jumps when lanes partially vanish.
+## 7) QoS & Performance
+- **Images**: SensorData (best_effort, keep_last(5)).
+- **Centerline/Mask**: Reliable, keep_last(10).
+- **Composition**: run SCNN and post-processing in the **same process** with intra-process comms; pin Jetson to max perf.
+- Target latency: SCNN < **25 ms**, post-processing < **5–10 ms** @ 30 FPS (tune per device).
 
 ---
 
-## 9) Tunables (quick reference)
+## 8) Message Contracts (canonical)
 
-Category | Parameter | Typical Range / Default | Effect
---- | --- | --- | ---
-DBSCAN | eps (pixels) | 2–6 | Cluster tightness; higher joins more pixels
-DBSCAN | min_samples | 20–60 | Suppresses small blobs
-Polyfit | order | 2–3 | 3 captures gentle curvature; avoid overfit
-Depth | median window | 3×3 to 7×7 | Stabilizes missing/noisy depth
-Smoothing | EMA alpha | 0.2–0.5 | Lower = smoother, higher latency
-Drift | e_y threshold | 0.2–0.3 m | Sensitivity of drift alarms
+### `/lane_mask` (`sensor_msgs/Image`)
+- 8-bit, single-channel, 640×480, values {0,255}; `header.frame_id = camera_color_optical_frame`.
+
+### `/centerline_path` (`nav_msgs/Path`)
+- `header.frame_id = output_frame_id`.
+- `poses[i].pose.position = (x, y, z)`; orientation optional (tangent yaw).
+
+### `/centerline_3d` (legacy — `std_msgs/Float32MultiArray`)
+- `data = [x1, y1, z1, ..., xN, yN, zN]` (meters) in `output_frame_id`.
+- `layout.dim[0] = {label: "xyz_flat", size: 3*N, stride: 1}`.
 
 ---
+
+## 9) Performance, Limits, and Lessons
+- **Post-processing quality dominates** overall path usability.
+- Challenging cases: low light, glare, lane wear → mitigate with mask-space median filtering, coefficient smoothing, and continuity penalties.
+- Track **FPS/latency**, mask **IoU**, and **centerline lateral error** vs ground truth or SLAM.
+
+---
+
+
 
 ## 10) Troubleshooting
 
-Symptom | Likely Cause | Fix
---- | --- | ---
-Centerline “jumps” between frames | Outliers / missing side | Use RANSAC, enforce continuity, increase EMA smoothing
-Depth spikes near edges | Invalid pixels around lane paint | Expand median window; clamp Z to valid range (e.g., 0.3–6 m)
-Mask tears in glare | Over/under-exposed regions | Adaptive thresholding, brightness normalization before SCNN
-Mismatched frames | Time sync issues | Use ApproximateTimeSynchronizer or compose nodes to co-stamp RGB/Depth
+| Symptom | Likely Cause | Fix |
+|---|---|---|
+| Centerline jumps between frames | Outliers / missing side | Enable RANSAC; enforce continuity; increase EMA smoothing. |
+| Depth spikes near paint edges | Invalid pixels | Expand median window; clamp `Z` to `[0.3, 6.0]` m. |
+| Mask tears in glare | Over/under-exposure | Adaptive thresholding, brightness normalization pre-SCNN. |
+| Mismatched frames | Time sync issues | ApproximateTime sync; composition with co-stamped RGB/Depth. |
+```
