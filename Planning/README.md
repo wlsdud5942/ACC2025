@@ -1,4 +1,4 @@
-# Planning Module — Process-Centric README (Revised)
+# Planning Module
 
 This module stabilizes end-to-end driving on a **static track** by combining **offline preprocessing** (path generation) with **runtime streaming**. We prebuild high-quality local paths per segment using **RRT**, optimize the **visit order** of stops/waypoints using a lightweight **DQN** planner, and then stream waypoints at fixed timing via a helper node **without distance-based reach checks**. The FSM (Simulink) handles stop/start independently through events.
 
