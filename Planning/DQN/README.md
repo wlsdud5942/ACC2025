@@ -1,4 +1,4 @@
-# `DQN` — Visit-Order Optimization with a Lightweight DQN
+# DQN
 
 This module computes a **visit sequence** for user-specified **stops / waypoints** on a **directed graph** (nodes `0..59`). It uses a tiny **Deep Q-Network (NumPy-only)** with a robust **BFS fallback** to avoid dead-ends and loops. The final plan is written to **`dqn_paths.json`**, which `helper_path_sender` consumes directly for runtime streaming.
 
@@ -8,35 +8,35 @@ This module computes a **visit sequence** for user-specified **stops / waypoints
 
 - From a list of stops `[a1, a2, …, an]`, produce an **ordered route** that starts at `0`, visits all stops once, and ends at `59`.
 - Penalize **loops** and **revisits**, gently encourage progress through **branch nodes**, and prefer short transitions.
-- Output includes both **per-leg node sequences** (`"p1"`, `"p2"`, …) and a **global concatenated sequence** (`"total"`).
+- Output includes both **per-leg node sequences** (`p1`, `p2`, … in `paths`) and a **global concatenated sequence** (`total`).
 
 ---
 
 ## 1) Graph Model & Reward (exactly as in code)
 
 **Graph**
-- `graph = { node: [neighbors] }` with nodes `0…59` (directed).
+- Directed adjacency: `graph = { node: [neighbors] }` with nodes `0…59`.
+- Optional metadata: out-degree, SCC membership (precomputed once at startup).
 
-**Rewards**
+**Rewards** (per step from `s → a`, reaching `next`):
 - Goal reached (`next == goal`) → **+100**
-- Branch node (out-degree > 1) → **+5**
-- Loop node (member of SCC with size > 1) → **−1000**
+- Branch node (`out_degree(next) > 1`) → **+5**
+- Loop node (`next` ∈ SCC with size > 1) → **−1000**
 - Ordinary move → **−1**
-- Revisit penalty → **−10 × (times the node was already visited)**; `PENALTY_P = 10`
+- Revisit penalty → **−PENALTY_P × visits(next)`**, with `PENALTY_P = 10`
 
 **Why this works**
 - Large negative for loops kills oscillation.
 - Revisit penalty suppresses needless back-and-forth.
 - Small positive on branches helps the agent commit through decisions.
-- If DQN still fails to reach the goal, we **fall back to BFS** shortest path.
+- If DQN stalls or fails within `max_steps`, **BFS** gives a deterministic fallback.
 
 ---
 
 ## 2) Learning & Inference Pipeline
 
 **Model**
-- `SimpleDQN(in=num_nodes, hid=64, out=num_nodes)`  
-  Two-layer MLP with ReLU; implemented in **NumPy** (no PyTorch/TF).
+- `SimpleDQN(in=num_nodes, hid=64, out=num_nodes)` — two-layer MLP with ReLU; **NumPy** only (no PyTorch/TF).
 
 **Schedule**
 - `episodes = 5000`, `max_steps = 100`
@@ -51,83 +51,108 @@ This module computes a **visit sequence** for user-specified **stops / waypoints
 **Global sequence**
 - Expand `[0] + stops + [59]` pairwise: `(0→a1), (a1→a2), …, (an→59)`.
 - Solve each pair; **deduplicate** consecutive nodes while concatenating.
-- Emit `"p1"`, `"p2"`, … for each leg, and `"total"` for the full tour.
+- Emit `paths = {"p1": [...], "p2": [...], ...}` per leg, and `total` for the full tour.
 
 ---
 
 ## 3) ROS2 Node Interface
 
 **Topics**
-- **Input**: `/dqn_path_input` (`std_msgs/Int32MultiArray`)  
-  Example payload: `[4, 7, 13]` → internally becomes `[0, 4, 7, 13, 59]`.
-- **Outputs**  
-  - `/dqn_done` (`std_msgs/Bool`) → `True` when `dqn_paths.json` is ready  
-  - `/dqn_path_result` (`std_msgs/String`) → pretty-printed JSON (same content as file)  
+- **Input**: `/dqn_path_input` (`std_msgs/Int32MultiArray`)
+  - Example payload: `[4, 7, 13]` → internally expands to `[0, 4, 7, 13, 59]`.
+- **Outputs**
+  - `/dqn_done` (`std_msgs/Bool`) → `True` when `dqn_paths.json` is ready
+  - `/dqn_path_result` (`std_msgs/String`) → pretty-printed JSON (same content as file)
   - **File**: `dqn_paths.json`
 
 **QoS**
-- `RELIABLE`, `KEEP_LAST(10)`, `TRANSIENT_LOCAL` (late joiners still get the last result).
+- `RELIABLE`, `KEEP_LAST(10)`, `TRANSIENT_LOCAL` (late joiners still receive the last result).
 
-**`dqn_paths.json` (example)**
-    
-    {
-      "p1": [0, 1, 2, 3, 4],
-      "p2": [4, 5, 6, 7],
-      "p3": [7, 8, 9, 39, 40, 41],
-      "total": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 39, 40, 41, ..., 59]
-    }
+**Services (optional)**
+- `~clear_cache` (std_srvs/Trigger): drop cached pairwise results.
+- `~seed` (std_srvs/SetBool or custom): toggle fixed seed determinism.
 
 ---
 
-## 4) Failure & Improvement Log (highlights)
+## 4) Parameters
 
-- **V0 (rule / Q-table-like)** — In branch-heavy regions the agent **looped**.  
-  → Switched to a **trainable DQN**.
-
-- **V1 (DQN)** — Reached goals but sometimes **revisited nodes**.  
-  → Added **visit-count penalty** (−10 × count).
-
-- **V1.1** — Slow convergence on some pairs.  
-  → **Linear epsilon decay** + **branch-node bonus** (+5) improved exploration.
-
-- **V2** — Rare failures persisted.  
-  → Integrated a **BFS fallback**; now every pair yields a feasible path deterministically.
+| Parameter | Type | Default | Notes |
+|---|---|---:|---|
+| `episodes` | int | 5000 | DQN training episodes per pair.
+| `max_steps` | int | 100 | Max steps per episode.
+| `epsilon_start` | float | 0.5 | Linear decay start.
+| `epsilon_end` | float | 0.0 | Linear decay end.
+| `alpha` | float | 1e-3 | Learning rate.
+| `gamma` | float | 0.9 | Discount factor.
+| `hidden_dim` | int | 64 | DQN hidden layer width.
+| `penalty_revisit` | float | 10.0 | `PENALTY_P`.
+| `reward_goal` | float | 100.0 | Goal reward.
+| `reward_branch` | float | 5.0 | Branch node bonus.
+| `penalty_loop` | float | 1000.0 | SCC loop penalty.
+| `use_bfs_fallback` | bool | true | Deterministic fallback.
+| `seed` | int | 1234 | RNG seed (set `<0` to disable fixed seed).
+| `graph_source` | string | `config/graph.yaml` | Adjacency list.
+| `output_path` | string | `dqn_paths.json` | Output file path.
 
 ---
 
-## 5) Usage & Workflow
+## 5) `dqn_paths.json` Schema & Example
+
+**Canonical schema** :
+```json
+{
+  "paths": {
+    "p1": [0, 1, 2, 3, 4],
+    "p2": [4, 5, 6, 7],
+    "p3": [7, 8, 9, 39, 40, 41]
+  },
+  "total": ["p1", "p2", "p3"],
+  "stops": ["p1", "p3"],
+  "path_mode_map": {"p1": 0, "p2": 1, "p3": 2}
+}
+```
+- `paths[p_k]` is the **node sequence** for leg `k`.
+- `total` is the **ordered list of leg IDs** composing the full tour.
+- Optional `stops` and `path_mode_map` are used by the FSM/controller.
+
+
+
+---
+
+## 6) Usage & Workflow
 
 1. Launch the node (package names per your tree):
-   
-       ros2 run planning dqn_path_planner
-
+   ```bash
+   ros2 run planning dqn_path_planner
+   ```
 2. Publish stops to the input:
-   
-       ros2 topic pub /dqn_path_input std_msgs/Int32MultiArray '{data: [4, 7, 13]}'
-
-3. Wait for:
-   - `/dqn_done` → `True`
-   - `/dqn_path_result` → JSON output
-
-4. Confirm `dqn_paths.json` is written, then start `helper_path_sender` to stream according to `"total"`.
+   ```bash
+   ros2 topic pub /dqn_path_input std_msgs/Int32MultiArray '{data: [4, 7, 13]}'
+   ```
+3. Watch for `/dqn_done == True` and inspect `/dqn_path_result`.
+4. Confirm `dqn_paths.json` is written, then start `helper_path_sender` to stream according to `total`.
 
 **Notes**
-- At startup the node publishes `/dqn_done=False`, then `True` on completion.
-- The graph topology lives in the node source; update it when the track changes.
+- On startup, the node publishes `/dqn_done=False`, then `True` on completion.
+- Update the **graph topology** (`graph.yaml`) whenever the track changes.
 
 ---
 
-## 6) Determinism, Performance, Tuning
+## 7) Determinism, Performance, Tuning
 
 **Determinism**
-- Fix RNG seeds for `random` and `numpy` if you need reproducible runs; optionally cache solved pairwise paths.
+- Fix seeds for `random` and `numpy`; set `seed >= 0` in params; optionally cache solved pairwise paths.
 
 **Performance**
-- Reduce `episodes` (e.g., 1000–3000) for quicker results on easy pairs.
-- Increase `hidden_dim` (64→128) for larger graphs; adjust `alpha`.
-- Precompute frequent pairs offline and store them.
+- Reduce `episodes` (e.g., 1000–3000) for easy pairs; increase `hidden_dim` for larger graphs.
+- Precompute frequent pairs offline and store them; enable **BFS-only** mode for trivial subgraphs.
 
 **BFS-only mode**
-- For time-critical deployments, you can use BFS for “easy” pairs and keep DQN only for ambiguous subgraphs.
+- For time-critical deployments, use BFS for “easy” pairs and keep DQN only for ambiguous regions.
 
 ---
+
+## 8) Known Limitations
+- Graph must be **sane** (connected enough) for DQN/BFS to find feasible routes.
+- Reward shaping is hand-tuned; for very large graphs consider heuristic search or MILP.
+- NumPy DQN is **CPU-only** and minimal by design; migrate to PyTorch/TensorRT if scaling up.
