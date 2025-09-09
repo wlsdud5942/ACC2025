@@ -76,8 +76,4 @@ When depth/SLAM are momentarily unreliable, we generate near-term steering aroun
 | Steering sat (straight) | ±0.13 rad | Guardrail |
 | Steering sat (curve) | ±0.25 rad | Guardrail |
 
-## 8) Reproducibility & Artifacts
-- Stateflow chart (AEB × Avoidance) and controller scripts live under `controllers/` and `stateflow/`.  
-- Simscape parameter files and comparison scripts live under `hardware/simscape/`.  
-- ROS 2 launch files keep interface names identical to the Control spec.
 
