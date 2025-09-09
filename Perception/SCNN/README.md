@@ -1,4 +1,4 @@
-# SCNN-based Lane Detection — Dataset, Training, and Evaluation
+# SCNN
 
 We migrated from early **classification-style lanes** (unstable on sharp curvature/lighting jumps) to **segmentation-based SCNN**. Public weights were insufficient; we **retrained** on our track and stabilized geometry with **spline post-processing** to publish a smooth **3D centerline**. Input is **640×480 @ 30 Hz** (RGB + aligned depth).
 
@@ -26,8 +26,6 @@ We migrated from early **classification-style lanes** (unstable on sharp curvatu
 | `/camera/aligned_depth_to_color/image_raw` | `sensor_msgs/Image` | `camera_color_optical_frame` | SensorData | aligned depth |
 | `/lane_mask` | `sensor_msgs/Image` | `camera_color_optical_frame` | Reliable, depth=5 | 0/255 mask |
 | `/centerline_path` | `nav_msgs/Path` | `base_link` | Reliable, depth=10 | 3D, equal-arc samples |
-
-> We did **not** publish `/centerline_3d` in this project’s final wiring.
 
 ---
 
