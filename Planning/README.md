@@ -1,148 +1,112 @@
 # Planning Module
 
-This module stabilizes end-to-end driving on a **static track** by combining **offline preprocessing** (path generation) with **runtime streaming**. We prebuild high-quality local paths per segment using **RRT**, optimize the **visit order** of stops/waypoints using a lightweight **DQN** planner, and then stream waypoints at fixed timing via a helper node **without distance-based reach checks**. The FSM (Simulink) handles stop/start independently through events.
+We stabilize full-lap driving on a **static track** with **offline preprocessing** (RRT path bank + DQN visiting order) and a **timer-based runtime stream** (documented elsewhere). This README focuses on *what* is planned (RRT/DQN/Local Avoidance) and *why*, not on the data-sender implementation.
 
 ---
 
-## 0) Purpose and Design Constraints
+## 0) Purpose & Constraints
 
 **Goals**
-- Make full-lap driving robust on a static track using offline paths plus online, timing-based streaming.
-- Minimize synchronization errors between ROS2 and the Simulink FSM by separating “trajectory streaming” from “behavior events”.
+- Robust lap completion using offline segments plus timing-based streaming.
+- Minimize ROS 2 ↔ Simulink FSM desync by **separating trajectory streaming** from **behavior events**.
 
 **Key ideas**
-1. Run RRT many times per segment to build a **bank of smooth, collision‑free waypoints**.
-2. Use a NumPy DQN to compute the **optimal visiting order** of stops/intermediate nodes and save it as `dqn_paths.json`.
-3. At runtime, **stream** waypoints on a timer; the FSM **does not** rely on geometric reach checks.
+1. Run RRT many times per segment to build a **bank of smooth, collision-free waypoints**.
+2. Use a **NumPy-only DQN** to compute a **fast, low-memory visiting order**; serialize as `dqn_paths.json`.
+3. Keep runtime switching **time/index-based**, not distance-based (details in the streaming doc).
 
-**Real‑world constraints**
-- Simulink FSM vs ROS2 timing can drift; distance‑based switching caused jitter → we **removed reach conditions** from the streaming node.
-- Obstacles or transitions at **path‑ID boundaries** can cause discontinuities; avoidance merges **current + next ID** before computing offsets.
+**Real-world constraints**
+- Pose latency/noise made distance-based switching jittery → **reach conditions removed**.
+- Obstacles at **path-ID boundaries** → Local Avoidance **merges current+next ID** before offsetting to keep continuity.
 
-**Frames & coordinates**
-- Waypoints are expressed in `output_frame_id` (default `map` for static tracks; `base_link` allowed for short local segments).
-- If `map` is used, controllers that operate in `base_link` should transform at consume time using TF (`map → odom → base_link`).
+**Frames**
+- Offline artifacts are in `map` (meters). For short local avoidance we may operate in `base_link`; consumers transform via TF (`map → odom → base_link`).
 
 ---
 
 ## 1) Problem → Hypothesis → Validation
 
-1) **Unstable distance‑based switching**
-- **Problem**: Pose delay/noise caused segment switches to oscillate around thresholds, confusing the FSM.
-- **Hypothesis**: Stream `/path_x`, `/path_y` on a timer only; handle FSM events via separate topics.
-- **Validation**: Implemented a sliding‑window stream; switching became repeatable across runs.
+1) **Unstable distance-based switching**  
+   *Hypothesis*: time-based streaming + separate events → *Validated*: jitter removed, runs repeatable.
 
-2) **Collisions/discontinuities at boundaries**
-- **Problem**: Obstacles and path transitions co‑located at an ID boundary caused sharp turns.
-- **Hypothesis**: During avoidance, merge **current + next ID** into a single curve and compute the lateral‑offset path there.
-- **Validation**: Obstacle_Avoidance full‑path merge + offset yields a single continuous curve from avoidance to rejoin.
+2) **Boundary collisions/discontinuities**  
+   *Hypothesis*: during avoidance, compute offsets on a **merged (current+next) path** → *Validated*: single continuous curve to rejoin.
 
-3) **Visit‑order optimization**
-- **Problem**: Fixed stop order produced inefficient tours.
-- **Hypothesis**: A simple DQN with loop/branch penalties can learn a practical order quickly.
-- **Validation**: Custom NumPy DQN with BFS fallback robustly generates `dqn_paths.json`.
+3) **Inefficient visit order**  
+   *Hypothesis*: lightweight DQN with BFS fallback → *Validated*: immediate, low-memory plan (`dqn_paths.json`).
 
 ---
 
-## 2) Component Summary
+## 2) Components (planning only)
 
 | Component | Description |
 |---|---|
-| `rrt/` | Offline generation of per‑segment waypoint sets on a static map; repeated runs select smooth, short, collision‑free paths. |
-| `dqn/` | `DQNPathPlanner` that optimizes the visit order of stops/intermediate nodes. |
-| `waypoints_*.json` | Per‑segment arrays of `[x, y]` in meters; consistent sampling interval and heading direction. |
-| `dqn_paths.json` | DQN result: `{ "p1": [...], "p2": [...], "total": [...] }` where `total` is the global node sequence. |
-| `helper_path_sender` | Streams waypoints **without reach checks**; emits `/path_mode`, `/stop`, `/pickup_dropoff` as separate events. |
+| `rrt/` | Offline generation of per-segment candidates (dozens–thousands of trials), scoring by length/curvature/continuity/clearance, smoothing/resampling; keep champions as `waypoints_*.json`. |
+| `dqn/` | **DQNPathPlanner (NumPy-only)** computes the visit sequence of stops/intermediate nodes with explicit loop/revisit penalties; outputs `dqn_paths.json`. |
+| `local_planners/obstacle_avoidance/` | Local Avoidance (summary below): generates temporary offset paths and events to bypass forward obstacles and rejoin smoothly. |
 
-**Data contracts**
-- `waypoints_*.json`: list of `[x, y]` points in map/track plane coordinates (meters).
-- `dqn_paths.json`: segment node sequences `p1..pk` and the overall visiting order `total`.
+**Data contracts (files)**
+- `waypoints_*.json`: `[x, y]` list in meters, `frame_id=map`, uniform spacing `spacing_m`.
+- `dqn_paths.json`: per-leg node sequences and global `total` order (optional `stops`, `path_mode_map`).
 
 ---
 
-## 3) Core Node: `helper_path_sender` (Why streaming?)
+## 3) Local Avoidance (summary)
 
-**What it does**
-- Loads `dqn_paths.json` and sequentially loads each `waypoints_*.json` in the `total` order.
-- Publishes waypoints at a **fixed timer frequency** using a **sliding window of W points** (default `W=4`).
-- Exposes both **legacy** per‑axis streams (`/path_x`, `/path_y`) and **standard** `/planned_path` (`nav_msgs/Path`).
+**Objective**  
+When an obstacle lies on the nominal route, generate a **minimum-offset** lateral path that **stays within lane bounds** and **rejoins** smoothly, with timing stable under an FSM.
 
-**Why remove reach checks**
-- Geometric reach checks depend on pose latency/noise and frequently desynchronize with the FSM.
-- Streaming is purely **index/time‑based**; **events** remain independent.
+**Frames & I/O (summary)**  
+- Default compute/output in **`base_link`** for short-horizon behavior; optional `output_frame_id = map|odom`.  
+- Inputs (typical): `/obstacle_info` with one or more `[x, y, r]` triplets (m, base_link), current pose; nominal path IDs and points.  
+- Outputs: a short-horizon avoidance path (`nav_msgs/Path` **or** legacy `/path_x`, `/path_y`) and events `/avoid_start`, `/avoid_done`.
 
-**Termination & transitions**
-- Segment transition occurs when the **index** reaches the end of the segment (or when an **end‑of‑segment** timer expires). No distance thresholds.
-- `/planned_path` publishes the current window with `header.frame_id = output_frame_id`.
+**Core algorithm (concise)**  
+1) **Full-path merge**: concatenate **current + next** ID into a single working curve.  
+2) **Left-priority offset**: per-point normal `n_i`, increase by δ (e.g., 0.05 m) until the point-to-segment distance to the obstacle exceeds the threshold (`r_obs + car_half + margin`).  
+3) **C1 rejoin**: smooth the last 5–10 points (Bezier/Hermite) and unwrap yaw for continuity.  
+4) **Timer-based emission**: waypoints are streamed on a fixed period; controller switching is **not** distance-gated.  
+5) **Hysteresis**: require persistence (N frames) before entering avoidance; ignore retriggers during active avoidance.
 
-**Events (published by this node)**
-
-| Event | Meaning | When it’s published |
-|---|---|---|
-| `/stop` | Vehicle stop | Upon entering a segment listed in `stops.json` (with cooldown). |
-| `/pickup_dropoff` | Pickup or dropoff | According to the scenario definition (e.g., first/last stop). |
-| `/path_mode` | 0: straight, 1: curve, 2: start/finish | Derived from `path_mode_map` for each segment. |
+**Typical params**  
+`delta=0.05 m`, `max_k=20`, `safety_margin=0.05 m`, `merge_horizon_ids=1`, `timer_hz=5.0 Hz`.
 
 ---
 
-## 4) ROS2 Topics
+## 4) DQN (why this tiny model)
 
-| Topic | Dir | Type | Frame | Description |
-|---|---|---|---|---|
-| `/location` | Sub | `geometry_msgs/Pose2D` | consumer‑specific | Current pose (x, y, theta). |
-| `/dqn_done` | Sub | `std_msgs/Bool` | — | Trigger to (re)start streaming after DQN planning. |
-| `/path_x`, `/path_y` | Pub | `std_msgs/Float32` | `output_frame_id` | Legacy per‑axis streaming of W points (time‑based). |
-| `/planned_path` | Pub | `nav_msgs/Path` | `output_frame_id` | Standard sliding‑window path for controllers. |
-| `/path_mode` | Pub | `std_msgs/Int32` | — | Segment type: 0=straight, 1=curve, 2=start/finish. |
-| `/stop` | Pub | `std_msgs/Int32` | — | FSM stop command. |
-| `/pickup_dropoff` | Pub | `std_msgs/Int32` | — | FSM pickup/dropoff command. |
+- Chosen for **simplicity, speed, and immediate application** on a static loop.  
+- Rewards combine **goal bonus (+100)**, **loop penalty (−1000)** via SCC, **step cost (−1)**, **branch bonus (+5)**, and **revisit penalty (−10×visits)** to favor short, decisive, loop-free tours.  
+- Model: 2-layer MLP (hidden=64, ReLU; linear output), **MSE** loss with target \(y=r+\gamma \max Q(s',\cdot)\); ε-greedy (0.5→0.0).  
+- Determinism guarantee via **BFS fallback** when exploration stalls.
 
-**QoS recommendations**
-- Paths & events: `reliable`, `keep_last(10)`; use `transient_local` for events if late‑join recovery is needed.
-- Timer period must be stable; prefer steady timers and single‑threaded executor for determinism.
+**Example `dqn_paths.json`**
 
----
-
-## 5) Parameters
-
-| Parameter | Type | Default | Notes |
-|---|---|---:|---|
-| `output_frame_id` | string | `map` | Frame for waypoint publishing. Use `base_link` only for short local segments. |
-| `timer_hz` | float | 2.0 | Streaming frequency (Hz). |
-| `window_size` | int | 4 | Sliding window W. |
-| `publish_nav_path` | bool | true | Publish `/planned_path` (`nav_msgs/Path`). |
-| `publish_legacy_xy` | bool | true | Publish `/path_x`, `/path_y`. |
-| `use_index_end_trigger` | bool | true | End segment by index (not distance). |
-| `segment_timeout_s` | float | 30.0 | Optional max time per segment (backup termination). |
-| `cooldown_stop_frames` | int | 5 | Prevent duplicate `/stop` events at segment entry. |
-| `path_mode_map` | dict | — | Segment→mode mapping. |
+~~~json
+{
+  "paths": {
+    "p1": [0, 1, 2, 3, 4],
+    "p2": [4, 5, 6, 7],
+    "p3": [7, 8, 9, 39, 40, 41]
+  },
+  "total": ["p1", "p2", "p3"],
+  "stops": ["p1", "p3"],
+  "path_mode_map": { "p1": 0, "p2": 1, "p3": 2 }
+}
+~~~
 
 ---
 
-## 6) Tuning Notes
-- **Streaming frequency (`timer_hz`)**: balance controller bandwidth and CPU/network load.
-- **Window size (`W`)**: `4` works well for pure‑pursuit style controllers; increase for MPC with longer preview.
-- **Interpolation**: if your controller requires `C1` continuity, spline/Bézier post‑smoothing can be applied offline.
-- **Stops**: keep `stops.json` minimal and unambiguous; avoid back‑to‑back stop segments unless intentional.
+## 5) RRT (how we judge candidates)
+
+- **Run many trials** per pair (50–2000+); keep top **k %** by a **normalized weighted score**: length, mean/peak curvature, continuity penalties, clearance, and a jerk proxy.  
+- Typical limits: \( \kappa_{\max} \le 0.30\,\mathrm{m}^{-1} \), `clearance_min ≥ 0.30 m`.  
+- Uniform resampling (e.g., Δs=0.10 m), yaw unwrap/low-pass, curvature cleanup (SG/spline); validate loop connectivity.
 
 ---
 
-## 7) Testing & RViz Recipe
-1. Load `dqn_paths.json` and the referenced `waypoints_*.json` files.
-2. Run `helper_path_sender` with `publish_nav_path=true` and visualize `/planned_path` in RViz (Path display). Confirm `frame_id`.
-3. Verify event topics (`/stop`, `/pickup_dropoff`, `/path_mode`) fire at the correct segment entries.
-4. Record a rosbag2 and replay; check that the same timing/sequence reproduces.
+## 6) Evaluation (planning-wide)
 
----
-
-## 8) Failure Cases & Fixes
-
-| Issue | Symptom | Fix |
-|---|---|---|
-| RRT discontinuities | Sudden curvature change | Unify sampling interval; linear interpolation; heading correction for continuity. |
-| Collisions at boundaries | Sharp turns / miss at joins | During avoidance, always **merge two IDs** before offset computation. |
-| Duplicate stops | Multiple `/stop` per entry | Apply `cooldown_stop_frames`; de‑bounce per segment index. |
-| FSM vs ROS2 desync | Timing mismatch | Keep streaming and events separated; **no distance gating**. |
-
----
-
+- **RRT quality**: success rate, mean/95th length, \( \kappa_{\max} \) & clearance distributions, generation time.  
+- **DQN plan**: total length, #revisits, #loop entries, fork indecision rate, **compute latency** (ms), **memory** (MB).  
+- **End-to-end**: bag replay for **timing reproducibility**; on-car **lap time**, **off-track rate**, **event timeliness**.
