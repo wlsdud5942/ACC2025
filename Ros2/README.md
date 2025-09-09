@@ -96,7 +96,7 @@ The design emphasizes **timing robustness**, **deterministic handshakes**, and *
 ### A) Cold start (on vehicle)
 ```bash
 ros2 launch slam cartographer.launch.py use_sim_time:=false
-# start SCNN, YOLOv7
+# start SCNN, YOLOv4
 # ensure planning artifacts exist: rrt/outputs/*, dqn/dqn_paths.json
 ros2 run planning helper_path_sender  # publish_nav_path:=true
 # start Simulink FSM (subscribes: /planned_path or /path_x/y, /stop, /pickup_dropoff, /path_mode)
@@ -220,7 +220,6 @@ services:
 |---|---|
 | ROS 2 | Humble |
 | RealSense | librealsense 2.x (aligned depth enabled) |
-| PyTorch (YOLOv7 optional) | 1.12.x (Jetson FP16) |
 | Cartographer | cartographer_ros (Humble) |
 | Simulink ROS 2 toolbox | slros2 (matching Humble msgs) |
 ---
