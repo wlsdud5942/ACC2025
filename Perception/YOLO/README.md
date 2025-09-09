@@ -1,4 +1,4 @@
-# YOLO (Real-car) — Dataset, Training, and Evaluation
+# YOLOv4
 
 We first prototyped with **YOLOv8** (desktop training speed, strong tooling) and finally **deployed YOLOv4** on the car. YOLOv4 was chosen for **Jetson stability**, **TensorRT maturity**, and **low, predictable latency**. This node raises a **stop-line event** and (optionally) publishes **local-avoidance hints**. Camera input is **640×480 @ 30 Hz** from Intel RealSense D435i (aligned depth).
 
