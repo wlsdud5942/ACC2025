@@ -13,7 +13,7 @@ Subfolders
 - Loose coupling to the upstream planner via streamed waypoints and events (`/path_mode`, `/stop`).
 - Respect real-car traits (vendor filtering/saturation, deadband, mechanical backlash) through calibration and safety at the driver layer.
 
-## 1) ROS 2 Interface (contract)
+## 1) ROS 2 Interface 
 **Subscribe**
 - `/path_x` (`std_msgs/Float32`) — target waypoint X  
 - `/path_y` (`std_msgs/Float32`) — target waypoint Y  
