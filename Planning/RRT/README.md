@@ -19,22 +19,44 @@ On a static course, it is safer and more controllable to **precompute** a bank o
 ## 2) Quality metrics & score (why these)
 
 **Metrics**
-- Length \(L\) — shorter is better unless curvature spikes.  
-- Mean/peak curvature \(\bar{\kappa}, \kappa_{\max}\) — respect vehicle limits.  
-- Continuity \(P_{\text{cont}}\) — penalize heading jumps/discontinuities.  
-- Clearance \(P_{\text{clear}}\) — distance to inflated obstacles.  
-- Smoothness \(P_{\text{smooth}}\) — jerk proxy \( \lvert \Delta \kappa / \Delta s \rvert \) mean.
+- **Length** `L` — shorter is better unless curvature spikes.  
+- **Mean / peak curvature** `kbar`, `kappa_max` — respect vehicle limits.  
+- **Continuity** `P_cont` — penalize heading jumps / discontinuities.  
+- **Clearance** `P_clear` — distance to inflated obstacles.  
+- **Smoothness** `P_smooth` — jerk proxy `mean(|Δkappa / Δs|)`.
 
-**Normalized weighted score (default)**
-\[
-S = w_L\tilde L + w_{\bar\kappa}\widetilde{\bar\kappa} + w_{\kappa_{\max}}\widetilde{\kappa_{\max}}
-  + w_{\text{cont}}P_{\text{cont}} + w_{\text{clear}}P_{\text{clear}} + w_{\text{smooth}}P_{\text{smooth}}
-\]
-- Simple & interpretable; per-pair **min–max normalization** removes scale issues.  
-- Typical limits: \( \kappa_{\max} \le 0.30\,\mathrm{m}^{-1} \), `clearance_min ≥ 0.30 m`.
+> **Tip on math rendering**  
+> Some viewers don’t render LaTeX. We provide both a **LaTeX block** (if your viewer supports it) and an **ASCII-safe** formula.  
+> Use whichever renders correctly in your environment.
 
-**Alternative (for auditing)**: keep the **Pareto front** of non-dominated candidates to study tuning sensitivity.
+### Normalized weighted score
+```math
+S = w_L\,\tilde{L}
+  + w_{\bar{\kappa}}\,\widetilde{\bar{\kappa}}
+  + w_{\kappa_{\max}}\,\widetilde{\kappa_{\max}}
+  + w_{\text{cont}}\,P_{\text{cont}}
+  + w_{\text{clear}}\,P_{\text{clear}}
+  + w_{\text{smooth}}\,P_{\text{smooth}}
+```
 
+**Typical limits**
+```math
+\kappa_{\max} \le 0.30~\mathrm{m}^{-1},\qquad \texttt{clearance\_min} \ge 0.30~\mathrm{m}.
+```
+
+- Simple & interpretable; per-pair **min–max normalization** removes scale issues.
+
+### Normalized weighted score
+```
+S = w_L*L_tilde
+  + w_kbar*kbar_tilde
+  + w_kmax*kmax_tilde
+  + w_cont*P_cont
+  + w_clear*P_clear
+  + w_smooth*P_smooth
+
+Limits: kappa_max ≤ 0.30 1/m, clearance_min ≥ 0.30 m
+```
 ---
 
 ## 3) Performance reporting (for large trials)
