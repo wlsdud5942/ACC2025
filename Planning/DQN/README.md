@@ -1,80 +1,105 @@
 # DQN
 
-This module computes a **visit sequence** for user-specified **stops / waypoints** on a **directed graph** (nodes `0..59`). It uses a tiny **Deep Q-Network (NumPy-only)** with a robust **BFS fallback** to avoid dead-ends and loops. The final plan is written to **`dqn_paths.json`**, which `helper_path_sender` consumes directly for runtime streaming.
+For a static loop, we only need to decide **which nodes to visit and in what order**. We deliberately chose a **NumPy-only DQN** so the plan is computed **immediately** with **low latency and memory**, and we keep a **BFS fallback** to guarantee a result. This spec maps 1:1 to the provided implementation (`DQNPathPlanner`).
 
 ---
 
-## 0) Purpose
-
-- From a list of stops `[a1, a2, …, an]`, produce an **ordered route** that starts at `0`, visits all stops once, and ends at `59`.
-- Penalize **loops** and **revisits**, gently encourage progress through **branch nodes**, and prefer short transitions.
-- Output includes both **per-leg node sequences** (`p1`, `p2`, … in `paths`) and a **global concatenated sequence** (`total`).
+## 0) Why DQN (our intent)
+- **Immediate application**: no long training cycles or large memory footprints; results are available right away.  
+- **Low latency & memory**: 2-layer MLP (hidden=64) + ReLU runs on CPU in milliseconds.  
+- **Static-loop best fit**: the map is fixed; a tiny model is more than sufficient; no heavyweight retraining needed.  
+- **Determinism guard**: if exploration stalls, **BFS** returns a valid path.
 
 ---
 
-## 1) Graph Model & Reward (exactly as in code)
+## 1) Graph & reward (mirrors the code)
 
 **Graph**
-- Directed adjacency: `graph = { node: [neighbors] }` with nodes `0…59`.
-- Optional metadata: out-degree, SCC membership (precomputed once at startup).
+- `graph: Dict<int, List<int>>` with nodes `0..59`.  
+- **Branch nodes**: `out_degree > 1`.  
+- **Loop nodes**: members of SCCs with size > 1 (via `networkx.strongly_connected_components`).
 
-**Rewards** (per step from `s → a`, reaching `next`):
-- Goal reached (`next == goal`) → **+100**
-- Branch node (`out_degree(next) > 1`) → **+5**
-- Loop node (`next` ∈ SCC with size > 1) → **−1000**
-- Ordinary move → **−1**
-- Revisit penalty → **−PENALTY_P × visits(next)`**, with `PENALTY_P = 10`
+**Reward function** `get_reward_dynamic(goal)`
+- `next == goal` → **+100** (`R_goal`): strongly drives completion.  
+- `next ∈ loop_nodes` → **−1000** (`C_loop`): avoids cyclic traps.  
+- `next ∈ branch_nodes` → **+5** (`R_branch`): encourages decisive progress at forks.  
+- otherwise step cost → **−1** (`C_step`): biases toward shorter moves.  
+- **Revisit penalty** `−PENALTY_P × visits(next)` with `PENALTY_P = 10`: suppresses back-and-forth.
 
-**Why this works**
-- Large negative for loops kills oscillation.
-- Revisit penalty suppresses needless back-and-forth.
-- Small positive on branches helps the agent commit through decisions.
-- If DQN stalls or fails within `max_steps`, **BFS** gives a deterministic fallback.
+> Rationale: keep a **short-path bias** while guaranteeing **safety (no loops)**, **decisiveness at forks**, and **efficiency**.
 
 ---
 
-## 2) Learning & Inference Pipeline
+## 2) DQN model & learning (mirrors the code)
 
-**Model**
-- `SimpleDQN(in=num_nodes, hid=64, out=num_nodes)` — two-layer MLP with ReLU; **NumPy** only (no PyTorch/TF).
+- `SimpleDQN(in=num_nodes, hid=64, out=num_nodes)` — **ReLU** hidden, **linear** output.  
+- Loss: **MSE**, target \( y = r + \gamma \max_{a'} Q(s', a') \). (Huber is a drop-in alternative if needed.)  
+- Hyper-params: `episodes=5000`, `max_steps=100`, `alpha=1e-3`, `gamma=0.9`, `epsilon_start=0.5 → 0.0`.  
+- Policy: **ε-greedy** with linear decay.  
+- State: **one-hot** vector of the current node.  
+- Action: **only among allowed neighbors** of the current node.
 
-**Schedule**
-- `episodes = 5000`, `max_steps = 100`
-- `epsilon` linearly decays **0.5 → 0.0**
-- `alpha = 1e-3`, `gamma = 0.9`
-
-**Per (start, goal)**
-1. Train a fresh `SimpleDQN` with the reward shaping above.
-2. At inference, from state `s` choose `argmax Q(s, a)` among allowed actions `graph[s]`.
-3. If the agent stalls/cycles or fails to reach `goal` within `max_steps`, **BFS** provides a deterministic **fallback**.
-
-**Global sequence**
-- Expand `[0] + stops + [59]` pairwise: `(0→a1), (a1→a2), …, (an→59)`.
-- Solve each pair; **deduplicate** consecutive nodes while concatenating.
-- Emit `paths = {"p1": [...], "p2": [...], ...}` per leg, and `total` for the full tour.
+**Training loop**
+- See `dqn_path(start, goal)`: episode rollouts update weights online; inference selects `argmax Q` over neighbors; if no progress, fall back to `bfs_shortest_path`.
 
 ---
 
-## 3) ROS2 Node Interface
+## 3) Output & pipeline
 
-**Topics**
-- **Input**: `/dqn_path_input` (`std_msgs/Int32MultiArray`)
-  - Example payload: `[4, 7, 13]` → internally expands to `[0, 4, 7, 13, 59]`.
-- **Outputs**
-  - `/dqn_done` (`std_msgs/Bool`) → `True` when `dqn_paths.json` is ready
-  - `/dqn_path_result` (`std_msgs/String`) → pretty-printed JSON (same content as file)
-  - **File**: `dqn_paths.json`
+- From stops `[a1, …, an]`, expand to `(0→a1→…→an→59)`.  
+- Solve each pair; assemble **per-leg sequences** and a **global concatenated `total`** (deduplicating repeated endpoints).  
+- Save to `dqn_paths.json`, publish `/dqn_done=True` and `/dqn_path_result`.
 
-**QoS**
-- `RELIABLE`, `KEEP_LAST(10)`, `TRANSIENT_LOCAL` (late joiners still receive the last result).
+**Example (JSON schema)**
 
-**Services (optional)**
-- `~clear_cache` (std_srvs/Trigger): drop cached pairwise results.
-- `~seed` (std_srvs/SetBool or custom): toggle fixed seed determinism.
+~~~json
+{
+  "paths": {
+    "p1": [0, 1, 2, 3, 4],
+    "p2": [4, 5, 6, 7],
+    "p3": [7, 8, 9, 39, 40, 41]
+  },
+  "total": ["p1", "p2", "p3"],
+  "stops": ["p1", "p3"],
+  "path_mode_map": { "p1": 0, "p2": 1, "p3": 2 }
+}
+~~~
 
 ---
 
-## 4) Parameters
+## 4) How we evaluate
+
+**Metrics**
+- **Total travel length**, **# revisits**, **# loop entries**, **fork indecision rate**, **compute latency (ms)**, **memory (MB)**.  
+- On-car: **lap time**, **off-track rate**, **event timeliness** (arrival time error vs. schedule).
+
+**Procedure**
+1. **Offline replay**: multiple random seeds → mean/std/95th percentile per metric.  
+2. **Noise/missing-data tests**: inject noise or missing stops/edge costs to assess robustness.  
+3. **On-car A/B**: DQN visit order vs. manual/greedy baselines.
+
+> We log both **linear scores** and **non-linear penalties** (e.g., logistic loop penalty) for sensitivity analysis.
+
+---
+
+## 5) Further work
+
+- **Exploration design**: compare linear/exponential ε-schedules, **softmax** (temperature τ), **UCB/Thompson**, **NoisyNet**.  
+- **Model scaling**: for larger graphs, migrate to **PyTorch DQN**, **GNN/Transformer**-based scorers.  
+- **Time-series preprocessing**: encode stop reliability / sensor events with **LSTM/NLSTM**; feed as weights into the reward.  
+
+---
+
+## 6) ROS 2 interface
+
+- **Input**: `/dqn_path_input (std_msgs/Int32MultiArray)`  
+- **Outputs**: `/dqn_done (std_msgs/Bool)`, `/dqn_path_result (std_msgs/String)`, file `dqn_paths.json`  
+- **QoS**: RELIABLE, KEEP_LAST(10), TRANSIENT_LOCAL  
+- Node name: `dqn_path_planner`; publishes `/dqn_done=False` on startup, `True` when ready.
+
+---
+
+## 7) Parameters
 
 | Parameter | Type | Default | Notes |
 |---|---|---:|---|
@@ -95,64 +120,3 @@ This module computes a **visit sequence** for user-specified **stops / waypoints
 | `output_path` | string | `dqn_paths.json` | Output file path.
 
 ---
-
-## 5) `dqn_paths.json` Schema & Example
-
-**Canonical schema** :
-```json
-{
-  "paths": {
-    "p1": [0, 1, 2, 3, 4],
-    "p2": [4, 5, 6, 7],
-    "p3": [7, 8, 9, 39, 40, 41]
-  },
-  "total": ["p1", "p2", "p3"],
-  "stops": ["p1", "p3"],
-  "path_mode_map": {"p1": 0, "p2": 1, "p3": 2}
-}
-```
-- `paths[p_k]` is the **node sequence** for leg `k`.
-- `total` is the **ordered list of leg IDs** composing the full tour.
-- Optional `stops` and `path_mode_map` are used by the FSM/controller.
-
-
-
----
-
-## 6) Usage & Workflow
-
-1. Launch the node (package names per your tree):
-   ```bash
-   ros2 run planning dqn_path_planner
-   ```
-2. Publish stops to the input:
-   ```bash
-   ros2 topic pub /dqn_path_input std_msgs/Int32MultiArray '{data: [4, 7, 13]}'
-   ```
-3. Watch for `/dqn_done == True` and inspect `/dqn_path_result`.
-4. Confirm `dqn_paths.json` is written, then start `helper_path_sender` to stream according to `total`.
-
-**Notes**
-- On startup, the node publishes `/dqn_done=False`, then `True` on completion.
-- Update the **graph topology** (`graph.yaml`) whenever the track changes.
-
----
-
-## 7) Determinism, Performance, Tuning
-
-**Determinism**
-- Fix seeds for `random` and `numpy`; set `seed >= 0` in params; optionally cache solved pairwise paths.
-
-**Performance**
-- Reduce `episodes` (e.g., 1000–3000) for easy pairs; increase `hidden_dim` for larger graphs.
-- Precompute frequent pairs offline and store them; enable **BFS-only** mode for trivial subgraphs.
-
-**BFS-only mode**
-- For time-critical deployments, use BFS for “easy” pairs and keep DQN only for ambiguous regions.
-
----
-
-## 8) Known Limitations
-- Graph must be **sane** (connected enough) for DQN/BFS to find feasible routes.
-- Reward shaping is hand-tuned; for very large graphs consider heuristic search or MILP.
-- NumPy DQN is **CPU-only** and minimal by design; migrate to PyTorch/TensorRT if scaling up.
